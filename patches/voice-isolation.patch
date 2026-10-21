@@ -1,0 +1,2367 @@
+diff --git a/crates/audio-dsp/src/effects/mod.rs b/crates/audio-dsp/src/effects/mod.rs
+index 1a6f02a33c3352e3cab1d449d4f079121a4ccabd..8139f929ee7b08c1aee89d08c4ec771841f3c287 100644
+--- a/crates/audio-dsp/src/effects/mod.rs
++++ b/crates/audio-dsp/src/effects/mod.rs
+@@ -15,6 +15,7 @@ pub mod special;
+ mod stft;
+ pub mod time;
+ pub(crate) mod util;
++pub mod voice_isolation;
+ 
+ pub use channel::{Amplify, Balance, ChannelVolume, Invert, Route, Routing};
+ pub use declick::ClickRemover;
+@@ -29,6 +30,7 @@ pub use restoration::{DeHum, DeNoise};
+ pub use reverbs::{ConvolutionReverb, SurroundReverb};
+ pub use special::{AmbisonicsPanner, Binauralizer, ChannelMixer, Distortion, GuitarSuite, LoudnessMeterFx, Mastering, Mute, StereoExpander, VocalEnhancer};
+ pub use time::{Delay, Reverb};
++pub use voice_isolation::{VoiceIsoMeter, VoiceIsolator};
+ 
+ use crate::{AudioEffect, ParamSpec};
+ 
+@@ -143,6 +145,7 @@ static REGISTRY: &[EffectInfo] = &[
+     entry!("ambisonics_panner", "Panner - Ambisonics", Special, AmbisonicsPanner),
+     entry!("loudness_meter", "Loudness Meter", Special, LoudnessMeterFx),
+     entry!("mute", "Mute", Channel, Mute),
++    entry!("voice_isolation", "Voice Isolation", Restoration, VoiceIsolator),
+ ];
+ 
+ /// All registered effects.
+diff --git a/crates/audio-dsp/src/effects/voice_isolation.rs b/crates/audio-dsp/src/effects/voice_isolation.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..d4227aa2933999415def557f000d2146dab0abce
+--- /dev/null
++++ b/crates/audio-dsp/src/effects/voice_isolation.rs
+@@ -0,0 +1,957 @@
++//! Voice Isolation: keeps dialogue and removes everything else (steady noise, room tone, hum,
++//! rumble, crowd and — partly — music beds), in one effect.
++//!
++//! A multichannel streaming STFT (√Hann, 75 % overlap). Every frame one mask is estimated from
++//! the channel sum and applied to every channel, so the stereo image is preserved. The mask
++//! combines four cues:
++//!
++//! * **Stationary noise** — the noise PSD of every bin is tracked with minimum statistics (no
++//!   "learn" step); a decision-directed a-priori SNR drives an MMSE log-spectral-amplitude gain,
++//!   which keeps speech at moderate SNR and leaves smooth residual noise instead of musical noise. Digital silence (clip edges, pre-roll)
++//!   is not taken as the noise floor.
++//! * **Voicing** — the normalised autocorrelation of the band-limited (60 Hz–1.5 kHz) spectrum
++//!   gives a voicing strength and pitch; in voiced frames a soft harmonic comb attenuates the
++//!   energy between the voice's harmonics (below 4 kHz).
++//! * **Voice activity** — voicing and speech-band SNR give a per-frame speech-presence
++//!   probability with look-ahead (the gate opens [`LOOKAHEAD`] hops before an onset, so
++//!   consonants are not clipped), a 60 ms hold for word endings and a 30 ms release. Between
++//!   words everything is pulled down to the floor.
++//! * **Centre focus** (stereo only) — dialogue is normally centred; bins whose left/right
++//!   difference dominates their sum are attenuated.
++//!
++//! `amount` scales the reduction in decibels (`G = g^amount`), `floor` caps it, `listen`
++//! switches the output to the removed background (`1 − G`, so voice + background = the delayed
++//! input). Latency is `n + LOOKAHEAD · hop` samples.
++
++use crate::fft::Fft;
++use crate::{AudioEffect, ParamSpec, ParamValues, Smoothed, Unit, block_len, db_to_gain, param_plumbing};
++use std::f64::consts::PI;
++
++/// Look-ahead of the voice-activity gate, in hops.
++const LOOKAHEAD: usize = 2;
++/// Spectral history slots (the frame being synthesised plus the look-ahead frames).
++const SLOTS: usize = LOOKAHEAD + 1;
++/// Minimum-statistics sub-windows / window length / bias (as in `DeNoise`).
++const MS_SUBWINDOWS: usize = 8;
++const MS_WINDOW_S: f32 = 1.5;
++const MS_BIAS: f32 = 2.5;
++/// Decision-directed smoothing of the a-priori SNR.
++const DD_ALPHA: f32 = 0.98;
++/// Lowest a-priori SNR (−25 dB): limits how far the Wiener stage alone cuts.
++const XI_MIN: f32 = 0.003_162_3;
++/// Pitch search range (Hz).
++const F0_MIN: f32 = 70.0;
++const F0_MAX: f32 = 400.0;
++/// Harmonic comb upper limit (Hz).
++const COMB_MAX_HZ: f32 = 4000.0;
++/// Formant band protected by `preserve_formants` (Hz) and its minimum gain while speaking.
++const FORMANT_LO_HZ: f32 = 200.0;
++const FORMANT_HI_HZ: f32 = 4000.0;
++const FORMANT_PROTECT_DB: f32 = -14.0;
++/// Frames whose mean power per bin is below this are digital silence (not noise).
++const SILENCE_POWER: f32 = 1e-14;
++/// Internal sample-rate domain for design math; hostile rates are mapped into it.
++const SR_MIN: f32 = 4000.0;
++const SR_MAX: f32 = 768_000.0;
++
++#[inline]
++fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
++    if e1 <= e0 {
++        return if x >= e1 { 1.0 } else { 0.0 };
++    }
++    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
++    t * t * (3.0 - 2.0 * t)
++}
++
++/// Exponential integral E₁(x), x > 0 (Abramowitz & Stegun 5.1.53 / 5.1.56; |error| < 5e-5).
++fn expint_e1(x: f64) -> f64 {
++    let x = x.max(1e-7);
++    if x <= 1.0 {
++        -x.ln() - 0.577_215_66 + x * (0.999_991_93 + x * (-0.249_910_55 + x * (0.055_199_68 + x * (-0.009_760_04 + x * 0.001_078_57))))
++    } else {
++        let r = (x * x + 2.334_733 * x + 0.250_621) / (x * x + 3.330_657 * x + 1.681_534);
++        (-x).exp() / x * r
++    }
++}
++
++/// MMSE log-spectral-amplitude gain (Ephraim & Malah 1985) for a-priori SNR `xi` and
++/// a-posteriori SNR `gamma`, at most 1.
++fn lsa_gain(xi: f32, gamma: f32) -> f32 {
++    let w = xi / (1.0 + xi);
++    let v = f64::from(w * gamma).clamp(1e-7, 80.0);
++    (f64::from(w) * (0.5 * expint_e1(v)).min(10.0).exp()).clamp(0.0, 1.0) as f32
++}
++
++/// Per-hop one-pole coefficient (fraction moved towards the target) for a time constant.
++fn hop_coef(tau_s: f32, hop_s: f32) -> f32 {
++    if tau_s <= 0.0 { 1.0 } else { 1.0 - (-hop_s / tau_s).exp() }
++}
++
++#[inline]
++fn flush(x: f32) -> f32 {
++    if x.abs() < 1e-25 { 0.0 } else { x }
++}
++
++/// FFT size for speech: the power of two nearest above ~40 ms, 256…8192.
++fn frame_size(sr: f32) -> usize {
++    ((sr * 0.04) as usize).clamp(256, 8192).next_power_of_two().min(8192)
++}
++
++/// Snapshot of the analysis of the most recently synthesised frame (for meters and editors).
++#[derive(Clone, Copy, Debug, Default, PartialEq)]
++pub struct VoiceIsoMeter {
++    /// Speech-presence probability 0…1.
++    pub voice: f32,
++    /// Voicing strength 0…1 (normalised autocorrelation peak).
++    pub voicing: f32,
++    /// Estimated pitch in Hz (0 when unvoiced).
++    pub pitch_hz: f32,
++    /// Mean gain applied over 200 Hz–8 kHz, in dB (≤ 0 in voice mode).
++    pub reduction_db: f32,
++}
++
++/// Dialogue isolation by multi-cue spectral masking. See the module docs.
++pub struct VoiceIsolator {
++    pv: ParamValues,
++    sr: f32,
++    n: usize,
++    hop: usize,
++    bins: usize,
++    fft: Fft,
++    window: Vec<f32>,
++    /// Window autocorrelation normalised to 1 at lag 0 (bias correction of the voicing).
++    win_ac: Vec<f32>,
++    // ---- streaming buffers (per channel, `n` samples each, laid out channel-major)
++    input: Vec<f32>,
++    output: Vec<f32>,
++    pos: usize,
++    channels: usize,
++    // ---- spectral history: SLOTS × channels × bins (re, im)
++    hist_re: Vec<f32>,
++    hist_im: Vec<f32>,
++    /// Per slot (SLOTS × bins): the broadband pre-mask (smoothed over time and frequency) and
++    /// the fine structure (harmonic comb × centre focus, applied unsmoothed).
++    hist_mask: Vec<f32>,
++    hist_fine: Vec<f32>,
++    hist_vad: [f32; SLOTS],
++    hist_voicing: [f32; SLOTS],
++    hist_pitch: [f32; SLOTS],
++    frames: u64,
++    // ---- scratch
++    re: Vec<f32>,
++    im: Vec<f32>,
++    mix_p: Vec<f32>,
++    gains: Vec<f32>,
++    // ---- noise tracker
++    psd: Vec<f32>,
++    cur_min: Vec<f32>,
++    ring: Vec<f32>,
++    ring_pos: usize,
++    frames_in_sub: usize,
++    sub_frames: usize,
++    noise_started: bool,
++    g_prev: Vec<f32>,
++    gamma_prev: Vec<f32>,
++    // ---- smoothing state
++    g_state: Vec<f32>,
++    vad_state: f32,
++    /// Hops left before the voice gate starts to release.
++    vad_hold: u32,
++    meter: VoiceIsoMeter,
++    // ---- derived parameters
++    psd_coef: f32,
++    attack: f32,
++    release: f32,
++    vad_release: f32,
++    vad_hold_hops: u32,
++    oversub: f32,
++    voicing_thr: f32,
++    snr_thr: f32,
++    comb_depth: f32,
++    floor: f32,
++    amount: f32,
++    centre: f32,
++    preserve: bool,
++    listen_background: bool,
++    out_gain: Smoothed,
++}
++
++impl VoiceIsolator {
++    pub const PARAMS: &'static [ParamSpec] = &[
++        ParamSpec::new("amount", "Amount", 0.0, 100.0, 85.0, Unit::Percent),
++        ParamSpec::new("sensitivity", "Sensitivity", 0.0, 100.0, 65.0, Unit::Percent),
++        ParamSpec::new("floor", "Background Floor", -80.0, -6.0, -48.0, Unit::Decibels),
++        ParamSpec::toggle("preserve_formants", "Preserve Formants", true),
++        ParamSpec::new("center_focus", "Center Focus", 0.0, 100.0, 30.0, Unit::Percent),
++        ParamSpec::new("output", "Output Gain", -24.0, 24.0, 0.0, Unit::Decibels),
++        ParamSpec::choice("listen", "Output", &["Isolated Voice", "Removed Background"], 0),
++    ];
++
++    pub fn new(sample_rate: f32, channels: usize) -> Self {
++        let sr = if sample_rate.is_finite() { sample_rate.clamp(SR_MIN, SR_MAX) } else { 48_000.0 };
++        let n = frame_size(sr);
++        let hop = n / 4;
++        let bins = n / 2 + 1;
++        let ch = channels.clamp(1, 64);
++        let window: Vec<f32> = (0..n).map(|i| (0.5 - 0.5 * (2.0 * PI * i as f64 / n as f64).cos()).sqrt() as f32).collect();
++        let fft = Fft::new(n);
++        // Autocorrelation of the window via |W|² (same pipeline as the voicing analysis).
++        let (mut wr, mut wi) = (window.clone(), vec![0.0f32; n]);
++        fft.forward(&mut wr, &mut wi);
++        for k in 0..n {
++            wr[k] = wr[k] * wr[k] + wi[k] * wi[k];
++            wi[k] = 0.0;
++        }
++        fft.inverse(&mut wr, &mut wi);
++        let w0 = wr[0].max(1e-20);
++        let win_ac = wr.iter().map(|v| (v / w0).max(1e-3)).collect();
++        let hop_s = hop as f32 / sr;
++        let sub_frames = ((MS_WINDOW_S / hop_s / MS_SUBWINDOWS as f32).round() as usize).max(1);
++        let mut s = VoiceIsolator {
++            pv: ParamValues::new(Self::PARAMS),
++            sr,
++            n,
++            hop,
++            bins,
++            fft,
++            window,
++            win_ac,
++            input: vec![0.0; n * ch],
++            output: vec![0.0; n * ch],
++            pos: 0,
++            channels: ch,
++            hist_re: vec![0.0; SLOTS * ch * bins],
++            hist_im: vec![0.0; SLOTS * ch * bins],
++            hist_mask: vec![1.0; SLOTS * bins],
++            hist_fine: vec![1.0; SLOTS * bins],
++            hist_vad: [0.0; SLOTS],
++            hist_voicing: [0.0; SLOTS],
++            hist_pitch: [0.0; SLOTS],
++            frames: 0,
++            re: vec![0.0; n],
++            im: vec![0.0; n],
++            mix_p: vec![0.0; bins],
++            gains: vec![1.0; bins],
++            psd: vec![0.0; bins],
++            cur_min: vec![f32::INFINITY; bins],
++            ring: vec![f32::INFINITY; bins * MS_SUBWINDOWS],
++            ring_pos: 0,
++            frames_in_sub: 0,
++            sub_frames,
++            noise_started: false,
++            g_prev: vec![1.0; bins],
++            gamma_prev: vec![1.0; bins],
++            g_state: vec![1.0; bins],
++            vad_state: 0.0,
++            vad_hold: 0,
++            meter: VoiceIsoMeter::default(),
++            psd_coef: hop_coef(0.048, hop_s),
++            attack: hop_coef(0.008, hop_s),
++            release: hop_coef(0.025, hop_s),
++            vad_release: (-hop_s / 0.03).exp(),
++            vad_hold_hops: (0.06 / hop_s).round() as u32,
++            oversub: 1.0,
++            voicing_thr: 0.45,
++            snr_thr: 9.0,
++            comb_depth: 0.6,
++            floor: db_to_gain(-48.0),
++            amount: 0.85,
++            centre: 0.3,
++            preserve: true,
++            listen_background: false,
++            out_gain: Smoothed::with_ms(1.0, sr, 20.0),
++        };
++        s.apply_params(true);
++        s
++    }
++
++    fn apply_params(&mut self, snap: bool) {
++        let sens = self.pv.v("sensitivity") / 100.0;
++        self.oversub = 1.0 + 1.5 * sens;
++        self.voicing_thr = 0.30 + 0.25 * sens;
++        self.snr_thr = 3.0 + 9.0 * sens;
++        self.comb_depth = 0.3 + 0.5 * sens;
++        self.floor = db_to_gain(self.pv.v("floor"));
++        self.amount = self.pv.v("amount") / 100.0;
++        self.centre = self.pv.v("center_focus") / 100.0;
++        self.preserve = self.pv.on("preserve_formants");
++        self.listen_background = self.pv.idx("listen") == 1;
++        self.out_gain.set(db_to_gain(self.pv.v("output")));
++        if snap {
++            self.out_gain.snap();
++        }
++    }
++
++    /// Analysis of the most recently output frame.
++    pub fn meter(&self) -> VoiceIsoMeter {
++        self.meter
++    }
++
++    fn bin_hz(&self) -> f32 {
++        self.sr / self.n as f32
++    }
++
++    /// Window and FFT the newest `n` input samples of every channel into history slot `slot`,
++    /// accumulating the channel-sum power spectrum. Returns the mix spectrum in `re`/`im`.
++    fn analyse(&mut self, slot: usize, nch: usize) -> bool {
++        let (n, bins) = (self.n, self.bins);
++        // samples that are exactly zero on every channel: digital silence (clip edges, pre-roll)
++        let zeros = (0..n).filter(|&i| (0..nch).all(|c| self.input.get(c * n + i).is_none_or(|v| *v == 0.0))).count();
++        let mut mix_re = std::mem::take(&mut self.gains);
++        mix_re.iter_mut().for_each(|v| *v = 0.0);
++        let mut mix_im = std::mem::take(&mut self.mix_p);
++        mix_im.iter_mut().for_each(|v| *v = 0.0);
++        for c in 0..self.channels {
++            let base = (slot * self.channels + c) * bins;
++            if c >= nch {
++                self.hist_re[base..base + bins].iter_mut().for_each(|v| *v = 0.0);
++                self.hist_im[base..base + bins].iter_mut().for_each(|v| *v = 0.0);
++                continue;
++            }
++            let inp = &self.input[c * n..(c + 1) * n];
++            for i in 0..n {
++                self.re[i] = inp[i] * self.window[i];
++                self.im[i] = 0.0;
++            }
++            self.fft.forward(&mut self.re, &mut self.im);
++            self.hist_re[base..base + bins].copy_from_slice(&self.re[..bins]);
++            self.hist_im[base..base + bins].copy_from_slice(&self.im[..bins]);
++            for k in 0..bins {
++                mix_re[k] += self.re[k];
++                mix_im[k] += self.im[k];
++            }
++        }
++        self.re[..bins].copy_from_slice(&mix_re);
++        self.im[..bins].copy_from_slice(&mix_im);
++        self.gains = mix_re;
++        self.mix_p = mix_im;
++        zeros * 20 > n
++    }
++
++    /// Compute the pre-mask and frame data of history slot `slot` from the mix spectrum in
++    /// `re`/`im` and the per-channel spectra in the slot.
++    fn estimate(&mut self, slot: usize, nch: usize, edge: bool) {
++        let bins = self.bins;
++        let bin_hz = self.bin_hz();
++        for k in 0..bins {
++            self.mix_p[k] = self.re[k] * self.re[k] + self.im[k] * self.im[k];
++        }
++        let total: f32 = self.mix_p.iter().sum::<f32>() / bins as f32;
++        let silent = !total.is_finite() || total <= SILENCE_POWER;
++        // a frame that is partly digital silence is not a noise observation (it would drag the
++        // minimum down for a whole tracking window at every clip start)
++        let observe = !silent && !edge;
++
++        // ---- noise tracking (minimum statistics on the smoothed periodogram)
++        let pc = self.psd_coef;
++        if observe {
++            for k in 0..bins {
++                let p = self.mix_p[k];
++                self.psd[k] = if self.noise_started { flush(self.psd[k] + pc * (p - self.psd[k])) } else { p };
++                self.cur_min[k] = self.cur_min[k].min(self.psd[k]);
++            }
++            self.noise_started = true;
++            self.frames_in_sub += 1;
++        }
++        let rotate = observe && self.frames_in_sub >= self.sub_frames;
++
++        // ---- MMSE-LSA gain from a decision-directed a-priori SNR
++        let mut sig = 0.0f32;
++        let mut noi = 0.0f32;
++        let (snr_lo, snr_hi) = ((200.0 / bin_hz) as usize, ((8000.0 / bin_hz) as usize).min(bins - 1));
++        for k in 0..bins {
++            let mut m = self.cur_min[k];
++            for u in 0..MS_SUBWINDOWS {
++                m = m.min(self.ring[u * bins + k]);
++            }
++            let noise = if m.is_finite() { (m * MS_BIAS).max(1e-20) } else { 1e-20 };
++            if rotate {
++                self.ring[self.ring_pos * bins + k] = self.cur_min[k];
++                self.cur_min[k] = f32::INFINITY;
++            }
++            if (snr_lo..=snr_hi).contains(&k) {
++                sig += self.mix_p[k];
++                noi += noise;
++            }
++            let gamma = (self.mix_p[k] / (noise * self.oversub)).min(1e8);
++            let xi = (DD_ALPHA * self.g_prev[k] * self.g_prev[k] * self.gamma_prev[k] + (1.0 - DD_ALPHA) * (gamma - 1.0).max(0.0)).max(XI_MIN);
++            let g = if silent { self.g_prev[k] } else { lsa_gain(xi, gamma) };
++            self.g_prev[k] = g;
++            self.gamma_prev[k] = if silent { self.gamma_prev[k] } else { gamma };
++            self.gains[k] = g;
++        }
++        if rotate {
++            self.ring_pos = (self.ring_pos + 1) % MS_SUBWINDOWS;
++            self.frames_in_sub = 0;
++        }
++        let snr_db = if silent || noi <= 0.0 { -60.0 } else { 10.0 * (sig.max(1e-30) / noi).log10() };
++
++        // ---- voicing and pitch: autocorrelation of the 60 Hz–1.5 kHz power spectrum
++        let (voicing, pitch) = if silent { (0.0, 0.0) } else { self.voicing() };
++
++        // ---- frame voice activity
++        let voiced = smoothstep(self.voicing_thr - 0.12, self.voicing_thr + 0.12, voicing);
++        let snr_conf = smoothstep(self.snr_thr - 6.0, self.snr_thr + 6.0, snr_db);
++        let vad = if silent { 0.0 } else { (voiced * smoothstep(-3.0, 6.0, snr_db)).max(snr_conf * (0.55 + 0.45 * voiced)) };
++
++        // ---- per-bin pre-mask: LSA × harmonic comb × centre focus × low-cut prior
++        let comb_on = voiced > 0.0 && pitch > 0.0;
++        let sigma0 = (1.5 * bin_hz).max(0.18 * pitch);
++        let stereo = nch == 2 && self.channels >= 2 && self.centre > 0.0;
++        let mbase = slot * bins;
++        for k in 0..bins {
++            let f = k as f32 * bin_hz;
++            let mut m = 1.0f32;
++            if comb_on && f >= 0.5 * pitch && f <= COMB_MAX_HZ {
++                let h = f / pitch;
++                let d = (h - h.round()).abs() * pitch;
++                let sigma = sigma0 * (1.0 + 0.04 * h);
++                let comb = (-0.5 * (d / sigma) * (d / sigma)).exp();
++                m *= 1.0 - self.comb_depth * voiced * (1.0 - comb);
++            }
++            if stereo {
++                let l = (slot * self.channels) * bins + k;
++                let r = l + bins;
++                let (lr, li, rr, ri) = (self.hist_re[l], self.hist_im[l], self.hist_re[r], self.hist_im[r]);
++                let d = (lr - rr) * (lr - rr) + (li - ri) * (li - ri);
++                let s = (lr + rr) * (lr + rr) + (li + ri) * (li + ri);
++                let side = d / (d + s + 1e-30);
++                let centredness = (1.0 - 2.0 * side).clamp(0.0, 1.0);
++                m *= 1.0 - self.centre * (1.0 - centredness);
++            }
++            self.hist_fine[mbase + k] = if m.is_finite() { m.clamp(0.0, 1.0) } else { 0.0 };
++            // speech low-cut prior: 40 Hz → 0, 90 Hz → 1
++            let b = self.gains[k] * smoothstep(40.0, 90.0, f);
++            self.hist_mask[mbase + k] = if b.is_finite() { b.clamp(0.0, 1.0) } else { 0.0 };
++        }
++        self.hist_vad[slot] = vad;
++        self.hist_voicing[slot] = voicing;
++        self.hist_pitch[slot] = pitch;
++    }
++
++    /// Normalised autocorrelation peak (0…1) and pitch (Hz) of the mix spectrum in `mix_p`.
++    fn voicing(&mut self) -> (f32, f32) {
++        let (n, bins) = (self.n, self.bins);
++        let bin_hz = self.bin_hz();
++        for k in 0..bins {
++            let f = k as f32 * bin_hz;
++            let w = smoothstep(40.0, 80.0, f) * (1.0 - smoothstep(1200.0, 1800.0, f));
++            self.re[k] = self.mix_p[k] * w;
++            self.im[k] = 0.0;
++        }
++        for k in 1..n / 2 {
++            self.re[n - k] = self.re[k];
++            self.im[n - k] = 0.0;
++        }
++        self.fft.inverse(&mut self.re, &mut self.im);
++        let r0 = self.re[0];
++        if !r0.is_finite() || r0 <= 1e-30 {
++            return (0.0, 0.0);
++        }
++        let lag_min = ((self.sr / F0_MAX).floor() as usize).max(2);
++        let lag_max = ((self.sr / F0_MIN).ceil() as usize).min(n / 2 - 2);
++        if lag_min + 2 >= lag_max {
++            return (0.0, 0.0);
++        }
++        let norm = |re: &[f32], ac: &[f32], t: usize| re[t] / r0 / ac[t];
++        let (mut best, mut best_lag) = (f32::MIN, lag_min);
++        for t in lag_min..=lag_max {
++            let v = norm(&self.re, &self.win_ac, t);
++            if v > best {
++                best = v;
++                best_lag = t;
++            }
++        }
++        // Parabolic interpolation around the peak for a fractional lag.
++        let (a, b, c) = (norm(&self.re, &self.win_ac, best_lag - 1), best, norm(&self.re, &self.win_ac, best_lag + 1));
++        let den = a - 2.0 * b + c;
++        let off = if den.abs() > 1e-12 { (0.5 * (a - c) / den).clamp(-0.5, 0.5) } else { 0.0 };
++        let lag = best_lag as f32 + off;
++        let voicing = if best.is_finite() { best.clamp(0.0, 1.0) } else { 0.0 };
++        (voicing, if voicing > 0.0 && lag > 0.0 { self.sr / lag } else { 0.0 })
++    }
++
++    /// Final gains for history slot `slot` (look-ahead voice gate, formant protection,
++    /// temporal and frequency smoothing, amount, listen mode) applied and overlap-added.
++    fn synthesise(&mut self, slot: usize, newest: usize, nch: usize) {
++        let (n, bins) = (self.n, self.bins);
++        let bin_hz = self.bin_hz();
++        // look-ahead: the gate opens for the frame if any frame up to the newest is speech
++        let mut onset = 0.0f32;
++        for i in 0..SLOTS {
++            onset = onset.max(self.hist_vad[(slot + i) % SLOTS]);
++            if (slot + i) % SLOTS == newest {
++                break;
++            }
++        }
++        if onset >= self.vad_state {
++            self.vad_state = onset;
++            self.vad_hold = self.vad_hold_hops;
++        } else if self.vad_hold > 0 {
++            self.vad_hold -= 1;
++        } else {
++            self.vad_state = flush(onset.max(self.vad_state * self.vad_release));
++        }
++        let p = self.vad_state;
++        let floor = self.floor;
++        let protect = if self.preserve { db_to_gain(FORMANT_PROTECT_DB).max(floor) * p } else { 0.0 };
++        let (f_lo, f_hi) = ((FORMANT_LO_HZ / bin_hz) as usize, (FORMANT_HI_HZ / bin_hz) as usize);
++        let mbase = slot * bins;
++        for k in 0..bins {
++            let mut t = self.hist_mask[mbase + k] * (floor + (1.0 - floor) * p);
++            if (f_lo..=f_hi).contains(&k) {
++                t = t.max(protect);
++            }
++            let t = t.max(floor);
++            let g = &mut self.g_state[k];
++            let c = if t > *g { self.attack } else { self.release };
++            *g = flush(*g + (t - *g) * c).max(floor);
++        }
++        // frequency smoothing against musical noise; while someone speaks it keeps gain peaks
++        // (the voice's harmonics) and only fills in isolated dips
++        let mut sum_db = 0.0f32;
++        let mut cnt = 0usize;
++        let (m_lo, m_hi) = ((200.0 / bin_hz) as usize, ((8000.0 / bin_hz) as usize).min(bins - 1));
++        let a = self.amount;
++        for k in 0..bins {
++            let g = &self.g_state;
++            let at = |j: isize| g[(k as isize + j).clamp(0, bins as isize - 1) as usize];
++            let avg = 0.25 * at(-1) + 0.5 * at(0) + 0.25 * at(1);
++            let s = avg + p * (at(0) - avg).max(0.0);
++            let s = (s * self.hist_fine[mbase + k]).max(floor);
++            // amount scales the reduction in dB: g^a
++            let gv = if a >= 1.0 {
++                s
++            } else if a <= 0.0 {
++                1.0
++            } else {
++                s.max(1e-12).powf(a)
++            };
++            let out = if self.listen_background { 1.0 - gv } else { gv };
++            self.gains[k] = out;
++            if (m_lo..=m_hi).contains(&k) {
++                sum_db += 20.0 * out.max(1e-6).log10();
++                cnt += 1;
++            }
++        }
++        self.meter = VoiceIsoMeter {
++            voice: p,
++            voicing: self.hist_voicing[slot],
++            pitch_hz: if self.hist_voicing[slot] >= self.voicing_thr { self.hist_pitch[slot] } else { 0.0 },
++            reduction_db: if cnt > 0 { sum_db / cnt as f32 } else { 0.0 },
++        };
++        let scale = 1.0 / (n as f32 * 2.0);
++        for c in 0..nch.min(self.channels) {
++            let base = (slot * self.channels + c) * bins;
++            for k in 0..bins {
++                self.re[k] = self.hist_re[base + k] * self.gains[k];
++                self.im[k] = self.hist_im[base + k] * self.gains[k];
++            }
++            self.im[0] = 0.0;
++            self.im[n / 2] = 0.0;
++            for k in 1..n / 2 {
++                self.re[n - k] = self.re[k];
++                self.im[n - k] = -self.im[k];
++            }
++            self.fft.inverse(&mut self.re, &mut self.im);
++            let out = &mut self.output[c * n..(c + 1) * n];
++            for i in 0..n {
++                out[i] += self.re[i] * self.window[i] * scale;
++            }
++        }
++    }
++
++    /// One hop boundary: shift buffers, analyse the newest frame, synthesise the look-ahead one.
++    fn hop_frame(&mut self, nch: usize) {
++        let (n, hop) = (self.n, self.hop);
++        for c in 0..self.channels {
++            let out = &mut self.output[c * n..(c + 1) * n];
++            out.copy_within(hop.., 0);
++            out[n - hop..].iter_mut().for_each(|v| *v = 0.0);
++        }
++        let newest = (self.frames % SLOTS as u64) as usize;
++        let edge = self.analyse(newest, nch);
++        self.estimate(newest, nch, edge);
++        let slot = ((self.frames + 1) % SLOTS as u64) as usize;
++        if self.frames >= LOOKAHEAD as u64 {
++            self.synthesise(slot, newest, nch);
++        }
++        self.frames += 1;
++        for c in 0..self.channels {
++            self.input[c * n..(c + 1) * n].copy_within(hop.., 0);
++        }
++    }
++}
++
++impl AudioEffect for VoiceIsolator {
++    param_plumbing!("voice_isolation");
++
++    fn latency(&self) -> usize {
++        self.n + LOOKAHEAD * self.hop
++    }
++
++    fn reset(&mut self) {
++        for v in [&mut self.input, &mut self.output, &mut self.hist_re, &mut self.hist_im, &mut self.psd] {
++            v.iter_mut().for_each(|x| *x = 0.0);
++        }
++        for v in [&mut self.hist_mask, &mut self.hist_fine, &mut self.g_prev, &mut self.gamma_prev, &mut self.g_state, &mut self.gains] {
++            v.iter_mut().for_each(|x| *x = 1.0);
++        }
++        self.cur_min.iter_mut().for_each(|x| *x = f32::INFINITY);
++        self.ring.iter_mut().for_each(|x| *x = f32::INFINITY);
++        self.hist_vad = [0.0; SLOTS];
++        self.hist_voicing = [0.0; SLOTS];
++        self.hist_pitch = [0.0; SLOTS];
++        self.pos = 0;
++        self.frames = 0;
++        self.ring_pos = 0;
++        self.frames_in_sub = 0;
++        self.noise_started = false;
++        self.vad_state = 0.0;
++        self.vad_hold = 0;
++        self.meter = VoiceIsoMeter::default();
++        self.out_gain.snap();
++    }
++
++    fn process(&mut self, channels: &mut [&mut [f32]]) {
++        let len = block_len(channels);
++        let nch = channels.len().min(self.channels);
++        let (n, hop) = (self.n, self.hop);
++        for i in 0..len {
++            let gain = self.out_gain.tick();
++            let pos = self.pos;
++            for (c, chan) in channels.iter_mut().take(nch).enumerate() {
++                let x = chan[i];
++                // hostile media: NaN/inf samples must not poison the recursive state
++                self.input[c * n + n - hop + pos] = if x.is_finite() { x } else { 0.0 };
++                chan[i] = self.output[c * n + pos] * gain;
++            }
++            self.pos += 1;
++            if self.pos == hop {
++                self.pos = 0;
++                self.hop_frame(nch);
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::testutil::*;
++
++    const SR: f32 = 48000.0;
++
++    /// A synthetic "talker": a harmonic voice (f0 gliding 110…160 Hz with vibrato, formant-
++    /// shaped harmonics) amplitude-modulated into ~4 syllables per second, with 300 ms pauses
++    /// every second. Returns (signal, per-sample "is speaking" flags).
++    fn talker(n: usize, sr: f32, amp: f32) -> (Vec<f32>, Vec<bool>) {
++        let mut out = vec![0.0f32; n];
++        let mut on = vec![false; n];
++        let mut phase = 0.0f64;
++        for i in 0..n {
++            let t = i as f64 / sr as f64;
++            let in_word = (t % 1.0) < 0.7;
++            let f0 = 135.0 + 25.0 * (2.0 * PI * 0.7 * t).sin() + 3.0 * (2.0 * PI * 5.5 * t).sin();
++            phase += 2.0 * PI * f0 / sr as f64;
++            let syll = 0.5 - 0.5 * (2.0 * PI * 4.0 * t).cos();
++            let env = if in_word { syll.powf(0.6) } else { 0.0 };
++            let mut v = 0.0f64;
++            for h in 1..=30 {
++                let fh = f0 * h as f64;
++                if fh > sr as f64 * 0.45 {
++                    break;
++                }
++                // two formant bumps (~500 Hz and ~1.5 kHz) over a −6 dB/oct tilt
++                let form = 1.0 + 2.0 * (-((fh - 500.0) / 250.0).powi(2)).exp() + 1.2 * (-((fh - 1500.0) / 400.0).powi(2)).exp();
++                v += form / h as f64 * (phase * h as f64).sin();
++            }
++            out[i] = (amp as f64 * 0.25 * env * v) as f32;
++            on[i] = in_word && syll > 0.3;
++        }
++        (out, on)
++    }
++
++    fn noise(seed: u64, n: usize, amp: f32) -> Vec<f32> {
++        let mut r = Rng::new(seed);
++        (0..n).map(|_| r.uniform() * amp).collect()
++    }
++
++    /// Energy of `y` (delayed by `lat`) over the samples of `x` selected by `sel`.
++    fn energy_where(y: &[f32], lat: usize, sel: impl Fn(usize) -> bool) -> f64 {
++        let mut e = 0.0f64;
++        let mut c = 0usize;
++        for i in 0..y.len().saturating_sub(lat) {
++            if sel(i) {
++                e += (y[i + lat] as f64).powi(2);
++                c += 1;
++            }
++        }
++        if c == 0 { 0.0 } else { e / c as f64 }
++    }
++
++    fn run(fx: &mut VoiceIsolator, chans: &mut [Vec<f32>]) {
++        let mut refs: Vec<&mut [f32]> = chans.iter_mut().map(|c| c.as_mut_slice()).collect();
++        fx.process(&mut refs);
++    }
++
++    #[test]
++    fn zero_amount_is_a_delayed_identity() {
++        for sr in [8000.0f32, 16000.0, 44100.0, 48000.0, 96000.0, 192000.0] {
++            let mut fx = VoiceIsolator::new(sr, 2);
++            fx.set_param("amount", 0.0);
++            fx.set_param("output", 0.0);
++            let lat = fx.latency();
++            let x = noise(3, (sr as usize).max(lat * 3), 0.5);
++            let mut y = vec![x.clone(), x.clone()];
++            run(&mut fx, &mut y);
++            for i in lat..x.len() {
++                assert!((y[0][i] - x[i - lat]).abs() < 1e-4, "sr {sr} i {i}: {} vs {}", y[0][i], x[i - lat]);
++            }
++        }
++    }
++
++    #[test]
++    fn voice_plus_removed_background_reconstructs_the_input() {
++        let (v, _) = talker(SR as usize * 3, SR, 0.5);
++        let bg = noise(4, v.len(), 0.05);
++        let x: Vec<f32> = v.iter().zip(&bg).map(|(a, b)| a + b).collect();
++        let mut voice = VoiceIsolator::new(SR, 1);
++        let mut back = VoiceIsolator::new(SR, 1);
++        back.set_param("listen", 1.0);
++        let lat = voice.latency();
++        let (mut a, mut b) = (vec![x.clone()], vec![x.clone()]);
++        run(&mut voice, &mut a);
++        run(&mut back, &mut b);
++        for i in lat..x.len() {
++            let s = a[0][i] + b[0][i];
++            assert!((s - x[i - lat]).abs() < 1e-4, "i {i}: {s} vs {}", x[i - lat]);
++        }
++    }
++
++    #[test]
++    fn removes_steady_noise_and_keeps_the_voice() {
++        let n = SR as usize * 8;
++        let (v, on) = talker(n, SR, 0.5);
++        let bg = noise(5, n, 0.03);
++        let x: Vec<f32> = v.iter().zip(&bg).map(|(a, b)| a + b).collect();
++        let mut fx = VoiceIsolator::new(SR, 1);
++        fx.set_param("amount", 100.0);
++        let lat = fx.latency();
++        let mut y = vec![x.clone()];
++        run(&mut fx, &mut y);
++        // after warm-up (2 s): pauses are pulled down hard once a word's tail (100 ms) is over,
++        // the voice keeps its level. Words end at 0.7 s of every second.
++        let warm = SR as usize * 2;
++        let red_in = |a: f32, b: f32| {
++            let sel = |i: usize| i > warm && (i as f32 / SR) % 1.0 > a && (i as f32 / SR) % 1.0 < b;
++            10.0 * (energy_where(&y[0], lat, sel) / energy_where(&x, 0, sel)).log10()
++        };
++        let (gap, whole) = (red_in(0.80, 0.96), red_in(0.70, 0.98));
++        assert!(gap < -25.0, "background between words only reduced {gap:.1} dB");
++        // the whole pause includes the 60 ms word-ending hold, kept at in-speech reduction
++        assert!(whole < -12.0, "background over the whole pause only reduced {whole:.1} dB");
++        let speech = |i: usize| i > warm && on[i];
++        let sp_in = energy_where(&v, 0, speech);
++        let sp_out = energy_where(&y[0], lat, speech);
++        let kept = 10.0 * (sp_out / sp_in).log10();
++        assert!(kept.abs() < 2.0, "voice level changed by {kept:.1} dB");
++        // SNR during speech improves too (output vs the clean voice)
++        let err: f64 = (warm..n - lat).filter(|&i| on[i]).map(|i| (y[0][i + lat] as f64 - v[i] as f64).powi(2)).sum();
++        let ref_err: f64 = (warm..n - lat).filter(|&i| on[i]).map(|i| (bg[i] as f64).powi(2)).sum();
++        assert!(err < ref_err * 0.7, "in-speech noise not reduced: {err} vs {ref_err}");
++    }
++
++    #[test]
++    fn amount_and_floor_scale_the_reduction() {
++        let n = SR as usize * 5;
++        let bg = noise(6, n, 0.05);
++        let red = |amount: f32, floor: f32| {
++            let mut fx = VoiceIsolator::new(SR, 1);
++            fx.set_param("amount", amount);
++            fx.set_param("floor", floor);
++            let lat = fx.latency();
++            let mut y = vec![bg.clone()];
++            run(&mut fx, &mut y);
++            let tail = SR as usize * 3;
++            10.0 * (energy_where(&y[0], lat, |i| i > tail) / energy_where(&bg, 0, |i| i > tail)).log10()
++        };
++        let full = red(100.0, -48.0);
++        let half = red(50.0, -48.0);
++        let shallow = red(100.0, -12.0);
++        assert!(full < -35.0, "full {full}");
++        assert!((half - full / 2.0).abs() < 4.0, "half {half} vs full {full}");
++        assert!((shallow + 12.0).abs() < 2.5, "floor −12 dB → {shallow}");
++    }
++
++    /// A melody (a new note every 200 ms, decaying, three harmonics): non-stationary, so the
++    /// noise tracker does not take it for noise.
++    fn melody(n: usize, sr: f32, amp: f32) -> Vec<f32> {
++        let notes = [262.0, 330.0, 392.0, 523.0, 440.0, 349.0, 294.0];
++        let step = (sr * 0.2) as usize;
++        (0..n)
++            .map(|i| {
++                let f = notes[(i / step) % notes.len()];
++                let t = (i % step) as f64 / sr as f64;
++                let env = (1.0 - (-t / 0.005).exp()) * (-t / 0.15).exp();
++                let ph = 2.0 * PI * f * i as f64 / sr as f64;
++                (amp as f64 * env * (ph.sin() + 0.5 * (2.0 * ph).sin() + 0.25 * (3.0 * ph).sin())) as f32
++            })
++            .collect()
++    }
++
++    #[test]
++    fn center_focus_removes_side_panned_sound() {
++        let n = SR as usize * 5;
++        let (v, on) = talker(n, SR, 0.4);
++        // centre voice, a melody hard-left
++        let bed = melody(n, SR, 0.15);
++        let l: Vec<f32> = v.iter().zip(&bed).map(|(a, b)| a + b).collect();
++        let r = v.clone();
++        let warm = SR as usize * 2;
++        let run_focus = |c: f32| {
++            let mut fx = VoiceIsolator::new(SR, 2);
++            fx.set_param("center_focus", c);
++            let lat = fx.latency();
++            let mut y = vec![l.clone(), r.clone()];
++            run(&mut fx, &mut y);
++            // one mask on both channels: L − R of the output is the processed bed alone
++            let side: Vec<f32> = y[0].iter().zip(&y[1]).map(|(a, b)| a - b).collect();
++            let bed_out = energy_where(&side, lat, |i| i > warm) / energy_where(&bed, 0, |i| i > warm);
++            let voice = energy_where(&y[1], lat, |i| i > warm && on[i]);
++            (10.0 * bed_out.log10(), voice)
++        };
++        let (bed0, voice0) = run_focus(0.0);
++        let (bed1, voice1) = run_focus(100.0);
++        assert!(bed1 < bed0 - 8.0, "centre focus: side bed {bed0:.1} dB → {bed1:.1} dB");
++        assert!((10.0 * (voice1 / voice0).log10()).abs() < 2.0, "centre voice changed");
++    }
++
++    #[test]
++    fn clean_studio_dialogue_is_left_alone() {
++        let n = SR as usize * 6;
++        let (v, on) = talker(n, SR, 0.5);
++        // a −75 dBFS noise floor, as in a quiet booth
++        let x: Vec<f32> = v.iter().zip(noise(11, n, 3e-4)).map(|(a, b)| a + b).collect();
++        let mut fx = VoiceIsolator::new(SR, 1);
++        let lat = fx.latency();
++        let mut y = vec![x];
++        run(&mut fx, &mut y);
++        let warm = SR as usize * 2;
++        let kept = 10.0 * (energy_where(&y[0], lat, |i| i > warm && on[i]) / energy_where(&v, 0, |i| i > warm && on[i])).log10();
++        assert!(kept.abs() < 1.0, "clean dialogue changed by {kept:.2} dB");
++    }
++
++    #[test]
++    fn meter_reports_voice_and_pitch() {
++        let n = SR as usize * 4;
++        let (v, _) = talker(n, SR, 0.5);
++        let mut fx = VoiceIsolator::new(SR, 1);
++        let mut saw_voice = false;
++        let mut pitches = Vec::new();
++        for chunk in v.chunks(1024) {
++            let mut c = vec![chunk.to_vec()];
++            run(&mut fx, &mut c);
++            let m = fx.meter();
++            assert!(m.voice.is_finite() && m.reduction_db.is_finite() && m.reduction_db <= 1e-3);
++            saw_voice |= m.voice > 0.9;
++            if m.pitch_hz > 0.0 {
++                pitches.push(m.pitch_hz);
++            }
++        }
++        assert!(saw_voice);
++        assert!(!pitches.is_empty());
++        let in_range = pitches.iter().filter(|p| (95.0..=180.0).contains(*p)).count();
++        assert!(in_range * 10 >= pitches.len() * 8, "pitch mostly within the talker's range: {in_range}/{}", pitches.len());
++        // pure noise: no voice
++        let mut fx = VoiceIsolator::new(SR, 1);
++        let mut x = vec![noise(7, n, 0.1)];
++        run(&mut fx, &mut x);
++        assert!(fx.meter().voice < 0.2, "noise flagged as voice: {:?}", fx.meter());
++    }
++
++    #[test]
++    fn hostile_input_and_construction() {
++        // NaN / inf samples don't poison later output
++        let mut fx = VoiceIsolator::new(SR, 2);
++        let mut l = noise(1, 20000, 0.3);
++        let mut r = noise(2, 20000, 0.3);
++        l[500] = f32::NAN;
++        r[900] = f32::INFINITY;
++        l[1200] = f32::NEG_INFINITY;
++        fx.process(&mut [&mut l, &mut r]);
++        let mut l = noise(3, 48000, 0.3);
++        let mut r = noise(4, 48000, 0.3);
++        fx.process(&mut [&mut l, &mut r]);
++        assert!(l.iter().chain(&r).all(|v| v.is_finite()));
++        assert!(rms(&l[24000..]) > 1e-6, "effect recovered after non-finite input");
++        // hostile sample rates and channel counts construct and run
++        for sr in [0.0f32, -48000.0, f32::NAN, f32::INFINITY, 1.0, 1e9] {
++            for ch in [0usize, 1, 2, 6, 1000] {
++                let mut fx = VoiceIsolator::new(sr, ch);
++                let mut a = vec![0.1f32; 3000];
++                let mut b = vec![-0.1f32; 3000];
++                fx.process(&mut [&mut a, &mut b]);
++                assert!(a.iter().chain(&b).all(|v| v.is_finite()), "sr {sr} ch {ch}");
++                assert!(fx.latency() > 0);
++            }
++        }
++        // mismatched channel lengths use the shortest
++        let mut fx = VoiceIsolator::new(SR, 2);
++        let mut a = vec![0.1f32; 100];
++        let mut b = vec![0.1f32; 50];
++        fx.process(&mut [&mut a, &mut b]);
++    }
++
++    #[test]
++    fn digital_silence_is_not_learned_as_the_noise_floor() {
++        // 2 s of zeros (pre-roll before a clip), then noise: the noise must be reduced quickly
++        // instead of passing until the tracker's window forgets the zeros.
++        let pre = SR as usize * 2;
++        let n = pre + SR as usize * 2;
++        let mut x = vec![0.0f32; n];
++        x[pre..].copy_from_slice(&noise(8, n - pre, 0.05));
++        let mut fx = VoiceIsolator::new(SR, 1);
++        fx.set_param("amount", 100.0);
++        let lat = fx.latency();
++        let mut y = vec![x.clone()];
++        run(&mut fx, &mut y);
++        let s = pre + SR as usize / 2;
++        let red = 10.0 * (energy_where(&y[0], lat, |i| i > s) / energy_where(&x, 0, |i| i > s)).log10();
++        assert!(red < -25.0, "noise after silence reduced only {red:.1} dB");
++    }
++
++    #[test]
++    fn output_gain_and_reset() {
++        let mut fx = VoiceIsolator::new(SR, 1);
++        fx.set_param("amount", 0.0);
++        fx.set_param("output", -6.0);
++        fx.reset();
++        let lat = fx.latency();
++        let x = noise(9, 30000, 0.3);
++        let mut y = vec![x.clone()];
++        run(&mut fx, &mut y);
++        let g = db_to_gain(-6.0);
++        for i in lat..x.len() {
++            assert!((y[0][i] - x[i - lat] * g).abs() < 1e-4);
++        }
++    }
++
++    /// Throughput on one core:
++    /// `cargo test --release -p filmcraft-audio-dsp voice_isolation_realtime -- --ignored --nocapture`
++    #[test]
++    #[ignore]
++    fn voice_isolation_realtime() {
++        let secs = 60usize;
++        let (v, _) = talker(SR as usize * secs, SR, 0.5);
++        let mut l: Vec<f32> = v.iter().zip(noise(12, v.len(), 0.03)).map(|(a, b)| a + b).collect();
++        let mut r = l.clone();
++        let mut fx = VoiceIsolator::new(SR, 2);
++        let t0 = std::time::Instant::now();
++        for (a, b) in l.chunks_mut(512).zip(r.chunks_mut(512)) {
++            fx.process(&mut [a, b]);
++        }
++        let t = t0.elapsed().as_secs_f64();
++        println!("voice isolation: {secs} s stereo 48 kHz in {t:.3} s = {:.0}× realtime (one core)", secs as f64 / t);
++    }
++}
+diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
+index 5d0a044d0f77971d3b6eec03dcb41c2cd6d2bd09..d34de7eeb68f43e66e9c0e34582cd0877537402c 100644
+--- a/crates/engine/src/lib.rs
++++ b/crates/engine/src/lib.rs
+@@ -1323,6 +1323,8 @@ mod trim_tests;
+ #[cfg(test)]
+ mod vfx_tests;
+ #[cfg(test)]
++mod voice_isolation_tests;
++#[cfg(test)]
+ mod voiceover_tests;
+ 
+ #[cfg(test)]
+diff --git a/crates/engine/src/voice_isolation_tests.rs b/crates/engine/src/voice_isolation_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..1a40a76aa81496aa53201d4b8dd37a1195aa25d5
+--- /dev/null
++++ b/crates/engine/src/voice_isolation_tests.rs
+@@ -0,0 +1,234 @@
++//! Voice Isolation through the engine: listed in its Effects-panel folder, applied by id and by
++//! name to clips and as a mixer insert, parameters set by id (and refused, not crashed, when
++//! hostile), latency compensated sample-exactly by the render path, Essential Sound ▸ Repair ▸
++//! Isolate Voice, undo, and the project round trip.
++
++use std::sync::Arc;
++
++use filmcraft_project::{ClipId, ParamValue, TrackItem};
++use serde_json::json;
++
++use super::*;
++
++const SR: u32 = 48_000;
++
++/// A talker under steady noise: a voiced source (f0 gliding around 135 Hz, harmonics falling
++/// 6 dB/oct) in ~4.5 syllables/s, speaking during the first 0.6 s of every second, plus noise.
++fn noisy_voice(secs: f64, noise: f32) -> (Vec<f32>, Vec<f32>) {
++    let n = (secs * SR as f64) as usize;
++    let mut phase = 0.0f64;
++    let mut seed = 0x2545_f491_4f6c_dd1d_u64;
++    let mut voice = Vec::with_capacity(n);
++    let mut mixed = Vec::with_capacity(n);
++    for i in 0..n {
++        let t = i as f64 / SR as f64;
++        let f0 = 135.0 + 25.0 * (2.0 * std::f64::consts::PI * 0.7 * t).sin();
++        phase += f0 / SR as f64;
++        let mut v = 0.0;
++        let mut k = 1;
++        while k as f64 * f0 < 4000.0 {
++            v += (2.0 * std::f64::consts::PI * phase * k as f64).sin() / k as f64;
++            k += 1;
++        }
++        let syl = 0.6 - 0.4 * (2.0 * std::f64::consts::PI * 4.5 * t).cos();
++        let v = if t % 1.0 < 0.6 { (v * syl * 0.15) as f32 } else { 0.0 };
++        seed ^= seed << 13;
++        seed ^= seed >> 7;
++        seed ^= seed << 17;
++        let r = ((seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0;
++        voice.push(v);
++        mixed.push(v + r * noise);
++    }
++    (voice, mixed)
++}
++
++/// A session with `x` as a stereo clip on A1 at `start` seconds.
++fn session_with(x: &[f32], start: f64) -> (Session, ClipId) {
++    let mut s = Session::default();
++    s.execute("file.newSequence", json!({"name": "vi", "audio": 2, "video": 1})).unwrap();
++    let inter: Vec<f32> = x.iter().flat_map(|v| [*v, *v]).collect();
++    let bytes: Arc<[u8]> = crate::previews::write_wav_f32(&inter, SR).into();
++    let item = crate::commands::import_bytes(&mut s, "/voice.wav", bytes, None).unwrap();
++    let r = s.execute("timeline.place", json!({"item": item.0, "audioTrack": "A1", "seconds": start})).unwrap();
++    s.execute("edit.deselectAll", json!({})).unwrap();
++    (s, ClipId(r["clips"][0].as_u64().unwrap()))
++}
++
++fn item(s: &Session, c: ClipId) -> TrackItem {
++    s.active_sequence().unwrap().find_item(c).unwrap().1.clone()
++}
++
++/// The clip's own signal (left channel) for `[a0, a0 + n)` timeline samples, requested in `chunk`s.
++fn clip_out(s: &Session, c: ClipId, a0: i64, n: usize, chunk: usize) -> Vec<f32> {
++    let it = item(s, c);
++    let provider = s.media.provider(s.project.clone(), s.services.clone());
++    let mut out = Vec::new();
++    let mut pos = a0;
++    while pos < a0 + n as i64 {
++        let m = chunk.min((a0 + n as i64 - pos) as usize);
++        out.extend_from_slice(&filmcraft_render::audio::clip_signal(&it, pos, m, SR, &provider).unwrap()[0]);
++        pos += m as i64;
++    }
++    out
++}
++
++fn energy(x: &[f32]) -> f64 {
++    x.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / x.len().max(1) as f64
++}
++
++fn set(s: &mut Session, c: ClipId, param: &str, value: serde_json::Value) {
++    s.execute("effects.setParam", json!({"clip": c.0, "effect": "voice_isolation", "param": param, "value": value})).unwrap();
++}
++
++#[test]
++fn listed_in_noise_reduction_and_applicable_by_id_and_name() {
++    let mut s = Session::default();
++    s.execute("file.openDemoProject", json!({})).unwrap();
++    let list = s.execute("effects.list", json!({"kind": "Audio"})).unwrap();
++    let e = list.as_array().unwrap().iter().find(|e| e["id"] == "voice_isolation").expect("listed").clone();
++    assert_eq!(e["name"], "Voice Isolation");
++    assert_eq!(e["category"], json!(["Audio Effects", "Noise Reduction/Restoration"]));
++    let clip = s.active_sequence().unwrap().audio_tracks[0].items[0].id;
++    for name in ["voice_isolation", "Voice Isolation"] {
++        let n0 = item(&s, clip).effects.len();
++        s.execute("effects.apply", json!({"clips": [clip.0], "effect": name})).unwrap();
++        let it = item(&s, clip);
++        assert_eq!(it.effects.len(), n0 + 1, "{name}");
++        assert_eq!(it.effects.last().unwrap().effect, "voice_isolation");
++    }
++    // as a track insert, set through the mixer, and the sequence still renders
++    s.execute("mixer.addInsert", json!({"strip": "A1", "effect": "voice_isolation"})).unwrap();
++    s.execute("mixer.setInsert", json!({"strip": "A1", "slot": 0, "params": {"amount": 100.0, "listen": 1}})).unwrap();
++    let provider = s.media.provider(s.project.clone(), s.services.clone());
++    let b = filmcraft_render::audio::mix_sequence(&s.project, s.active_sequence().unwrap(), 0, 9600, &provider);
++    assert_eq!(b.frames(), 9600);
++    assert!(b.channels.iter().flatten().all(|v| v.is_finite()));
++    // undo takes the insert and both clip effects away again
++    for _ in 0..4 {
++        s.execute("edit.undo", json!({})).unwrap();
++    }
++    assert!(item(&s, clip).effects.iter().all(|e| e.effect != "voice_isolation"));
++}
++
++#[test]
++fn hostile_parameters_are_refused_or_clamped_never_crash() {
++    let (x, _) = noisy_voice(2.0, 0.02);
++    let (mut s, c) = session_with(&x, 0.0);
++    s.execute("effects.apply", json!({"clips": [c.0], "effect": "voice_isolation"})).unwrap();
++    for (param, value) in
++        [("amount", json!("loud")), ("amount", json!([1, 2])), ("nope", json!(1.0)), ("listen", json!("Karaoke")), ("preserve_formants", json!("yes"))]
++    {
++        let r = s.execute("effects.setParam", json!({"clip": c.0, "effect": "voice_isolation", "param": param, "value": value}));
++        assert!(r.is_err(), "{param} = {value} accepted");
++    }
++    // out-of-range numbers are kept by the project but sanitised by the DSP: the render stays finite
++    for (param, value) in [("amount", 1e30), ("floor", -1e30), ("sensitivity", -5.0), ("output", 1e9), ("center_focus", f64::MAX)] {
++        set(&mut s, c, param, json!(value));
++    }
++    set(&mut s, c, "listen", json!("Removed Background"));
++    set(&mut s, c, "preserve_formants", json!(false));
++    let y = clip_out(&s, c, 0, SR as usize * 2, 4096);
++    assert!(y.iter().all(|v| v.is_finite()));
++    assert!(y.iter().all(|v| v.abs() <= 64.0), "output gain is clamped to +24 dB");
++}
++
++/// The render path compensates the effect's latency exactly: at Amount 0 the clip sounds the same
++/// with and without the effect, from the clip's first sample, however the requests are cut, from
++/// a cold start in the middle too.
++///
++/// `render::audio_fx` caches effect chains process-wide by (clip id, effect chain, rate, width),
++/// and clip ids repeat across the sessions of parallel tests, so tests that compare sample-exactly
++/// use an effect chain of their own (here a 0 dB Amplify in front) or whole-range requests.
++#[test]
++fn latency_is_compensated_sample_exactly() {
++    let (_, x) = noisy_voice(3.0, 0.02);
++    let (mut s, c) = session_with(&x, 0.5);
++    let a0 = item(&s, c).start.to_units_floor(SR as i64);
++    let n = SR as usize * 2;
++    let dry = clip_out(&s, c, a0, n, n);
++    s.execute("effects.apply", json!({"clips": [c.0], "effect": "amplify"})).unwrap();
++    s.execute("effects.apply", json!({"clips": [c.0], "effect": "voice_isolation"})).unwrap();
++    set(&mut s, c, "amount", json!(0.0));
++    for chunk in [n, 4800, 1031] {
++        let wet = clip_out(&s, c, a0, n, chunk);
++        let err = dry.iter().zip(&wet).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
++        assert!(err < 1e-4, "chunk {chunk}: max deviation {err}");
++    }
++    // cold start one second in (a seek): a fresh chain with pre-roll lands on the same samples
++    let mid = clip_out(&s, c, a0 + SR as i64, SR as usize / 2, 4800);
++    let err = dry[SR as usize..SR as usize * 3 / 2].iter().zip(&mid).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
++    assert!(err < 1e-4, "after a seek: max deviation {err}");
++}
++
++#[test]
++fn isolates_the_voice_and_the_background_is_the_rest() {
++    let (voice, x) = noisy_voice(5.0, 0.03);
++    let (mut s, c) = session_with(&x, 0.0);
++    s.execute("effects.apply", json!({"clips": [c.0], "effect": "voice_isolation"})).unwrap();
++    set(&mut s, c, "amount", json!(100.0));
++    // whole-range requests: always a fresh chain (see `latency_is_compensated_sample_exactly`)
++    let n = SR as usize * 5;
++    let kept = clip_out(&s, c, 0, n, n);
++    set(&mut s, c, "listen", json!(1));
++    let removed = clip_out(&s, c, 0, n, n);
++    // voice + removed background = the original, sample-aligned
++    let err = kept.iter().zip(&removed).zip(&x).map(|((a, b), o)| (a + b - o).abs()).fold(0.0f32, f32::max);
++    assert!(err < 1e-4, "voice + background differs from the input by {err}");
++    // pauses (0.75–0.95 s of every second, after warm-up) are pulled down; the voice stays
++    let sel = |sig: &[f32], a: f64, b: f64| -> Vec<f32> {
++        (2..5).flat_map(|k| sig[((k as f64 + a) * SR as f64) as usize..((k as f64 + b) * SR as f64) as usize].to_vec()).collect()
++    };
++    let gap = 10.0 * (energy(&sel(&kept, 0.8, 0.96)) / energy(&sel(&x, 0.8, 0.96))).log10();
++    let speech = 10.0 * (energy(&sel(&kept, 0.1, 0.5)) / energy(&sel(&voice, 0.1, 0.5))).log10();
++    println!("Voice Isolation: background in pauses {gap:.1} dB, voice {speech:+.2} dB");
++    assert!(gap < -25.0, "pauses only {gap:.1} dB");
++    assert!(speech.abs() < 1.5, "voice changed by {speech:.2} dB");
++}
++
++#[test]
++fn essential_sound_isolate_voice_drives_the_effect() {
++    let (_, x) = noisy_voice(2.0, 0.02);
++    let (mut s, c) = session_with(&x, 0.0);
++    s.execute("essentialSound.setType", json!({"clips": [c.0], "type": "dialogue"})).unwrap();
++    let es = |s: &Session| item(s, c).effects.into_iter().filter(|e| e.essential).collect::<Vec<_>>();
++    assert!(es(&s).iter().all(|e| e.effect != "voice_isolation"), "off by default");
++    s.execute("essentialSound.set", json!({"clips": [c.0], "values": {"repair.isolate.on": true, "repair.rumble.on": true, "repair.noise.on": true}})).unwrap();
++    let ids: Vec<String> = es(&s).iter().map(|e| e.effect.clone()).collect();
++    assert_eq!(ids, ["highpass", "voice_isolation", "denoise"], "canonical order");
++    let amount = |s: &Session| es(s).iter().find(|e| e.effect == "voice_isolation").and_then(|e| e.param("amount").map(|p| p.value.clone()));
++    assert_eq!(amount(&s), Some(ParamValue::Float(80.0)), "default slider 8 → 80 %");
++    s.execute("essentialSound.set", json!({"clips": [c.0], "values": {"repair.isolate.amount": 3.0}})).unwrap();
++    assert_eq!(amount(&s), Some(ParamValue::Float(30.0)));
++    // out of range is clamped, the wrong type refused
++    s.execute("essentialSound.set", json!({"clips": [c.0], "values": {"repair.isolate.amount": 1e9}})).unwrap();
++    assert_eq!(amount(&s), Some(ParamValue::Float(100.0)));
++    assert!(s.execute("essentialSound.set", json!({"clips": [c.0], "values": {"repair.isolate.on": "on"}})).is_err());
++    // the Repair switch disables it without removing it; Isolate Voice off removes it
++    s.execute("essentialSound.set", json!({"clips": [c.0], "values": {"repair.enabled": false}})).unwrap();
++    assert!(es(&s).iter().any(|e| e.effect == "voice_isolation" && !e.enabled));
++    s.execute("essentialSound.set", json!({"clips": [c.0], "values": {"repair.enabled": true, "repair.isolate.on": false}})).unwrap();
++    assert!(es(&s).iter().all(|e| e.effect != "voice_isolation"));
++    let y = clip_out(&s, c, 0, SR as usize, 4800);
++    assert!(y.iter().all(|v| v.is_finite()));
++}
++
++#[test]
++fn projects_round_trip_and_older_settings_load() {
++    let (_, x) = noisy_voice(1.0, 0.02);
++    let (mut s, c) = session_with(&x, 0.0);
++    s.execute("effects.apply", json!({"clips": [c.0], "effect": "voice_isolation"})).unwrap();
++    set(&mut s, c, "sensitivity", json!(90.0));
++    set(&mut s, c, "listen", json!(1));
++    let text = serde_json::to_string(&*s.project).unwrap();
++    let back: filmcraft_project::Project = serde_json::from_str(&text).unwrap();
++    let seq = s.state.active_sequence.and_then(|id| back.sequence(id)).unwrap();
++    let it = seq.find_item(c).unwrap().1.clone();
++    let e = it.effects.iter().find(|e| e.effect == "voice_isolation").unwrap();
++    assert_eq!(e.param("sensitivity").unwrap().value, ParamValue::Float(90.0));
++    assert_eq!(e.param("listen").unwrap().value, ParamValue::Choice(1));
++    // Essential Sound settings saved before Isolate Voice existed load with it off
++    let old = json!({"kind": "Dialogue", "repair": {"enabled": true, "noise": {"on": true, "amount": 4.0}}});
++    let es: filmcraft_project::essential::EssentialSound = serde_json::from_value(old).unwrap();
++    assert!(!es.repair.isolate.on);
++    assert!(es.repair.noise.on);
++}
+diff --git a/crates/project/src/effect.rs b/crates/project/src/effect.rs
+index 031bceb1aab202e69f506a7275f3a4b4509b974e..4f3094deba2a0e3ff32e9f2bb4a563bfb49b4fc0 100644
+--- a/crates/project/src/effect.rs
++++ b/crates/project/src/effect.rs
+@@ -14,7 +14,7 @@ use crate::keyframe::{Param, ParamValue};
+ 
+ mod audio;
+ use crate::mask::Mask;
+-pub use audio::{GEQ10_LABELS, GEQ20_LABELS, GEQ30_LABELS, PREMIERE_AUDIO_EFFECTS};
++pub use audio::{GEQ10_LABELS, GEQ20_LABELS, GEQ30_LABELS, PREMIERE_AUDIO_EFFECTS, VOICE_ISOLATION_OUTPUTS};
+ 
+ mod vfx;
+ pub use vfx::{EASINGS, ECHO_OPERATORS, FRAME_LAYOUTS, LIGHT_IDS, SIMPLE_BLEND, TRACK_CHOICES, auto_point, ultra_key_setting};
+diff --git a/crates/project/src/effect/audio.rs b/crates/project/src/effect/audio.rs
+index 16734233b5bf17726e492a67e3580aacb4a3a841..e800b1db56e6ced9fa988a17bc832508759f1054 100644
+--- a/crates/project/src/effect/audio.rs
++++ b/crates/project/src/effect/audio.rs
+@@ -45,6 +45,9 @@ pub const GEQ30_LABELS: [&str; 30] = [
+     "25 Hz", "31.5 Hz", "40 Hz", "50 Hz", "63 Hz", "80 Hz", "100 Hz", "125 Hz", "160 Hz", "200 Hz", "250 Hz", "315 Hz", "400 Hz", "500 Hz", "630 Hz", "800 Hz",
+     "1 kHz", "1.25 kHz", "1.6 kHz", "2 kHz", "2.5 kHz", "3.15 kHz", "4 kHz", "5 kHz", "6.3 kHz", "8 kHz", "10 kHz", "12.5 kHz", "16 kHz", "20 kHz",
+ ];
++/// Voice Isolation's Output choices (what is heard).
++pub const VOICE_ISOLATION_OUTPUTS: &[&str] = &["Isolated Voice", "Removed Background"];
++
+ const BAND_IDS: [&str; 30] = [
+     "b1", "b2", "b3", "b4", "b5", "b6", "b7", "b8", "b9", "b10", "b11", "b12", "b13", "b14", "b15", "b16", "b17", "b18", "b19", "b20", "b21", "b22", "b23",
+     "b24", "b25", "b26", "b27", "b28", "b29", "b30",
+@@ -426,6 +429,22 @@ pub(super) fn defs() -> Vec<EffectDef> {
+             vec![f("amount", "Amount", 50.0, 0.0, 100.0, "%"), fs("rt60", "Decay Time (RT60)", 0.8, (0.1, 5.0), (0.1, 3.0), "s", 2)],
+         ),
+         audio("speech_enhance", "Enhance Speech", A_NOISE, vec![f("mix", "Mix", 100.0, 0.0, 100.0, "%"), ch("tone", "Voice", &["Low Tone", "High Tone"], 0)]),
++        // Not a Premiere effect: dialogue isolation (filmcraft-audio-dsp `voice_isolation`; the
++        // parameters map one-to-one).
++        audio(
++            "voice_isolation",
++            "Voice Isolation",
++            A_NOISE,
++            vec![
++                pct("amount", "Amount", 85.0, 0.0, 100.0),
++                pct("sensitivity", "Sensitivity", 65.0, 0.0, 100.0),
++                db("floor", "Background Floor", -48.0, -80.0, -6.0),
++                b("preserve_formants", "Preserve Formants", true),
++                pct("center_focus", "Center Focus", 30.0, 0.0, 100.0),
++                db("output", "Output Gain", 0.0, -24.0, 24.0),
++                ch("listen", "Output", VOICE_ISOLATION_OUTPUTS, 0),
++            ],
++        ),
+         // ---- Reverb ----
+         audio(
+             "convolution_reverb",
+diff --git a/crates/project/src/essential.rs b/crates/project/src/essential.rs
+index cd7bf31be72b2be544acd1cdc59a8cbe7a41e8d9..84e56fc07103b0b5cd098b5d0c7e4632644a628f 100644
+--- a/crates/project/src/essential.rs
++++ b/crates/project/src/essential.rs
+@@ -3,7 +3,7 @@
+ //!
+ //! The panel never processes audio itself. Like Premiere, it drives effects on the clip "under the
+ //! hood": Reduce Rumble is a Highpass, Reduce Noise a DeNoise, DeHum a DeHummer, DeEss a DeEsser,
+-//! Reduce Reverb a DeReverb, Dynamics a Dynamics Processing, EQ a Parametric Equalizer, Enhance
++//! Reduce Reverb a DeReverb, Isolate Voice a Voice Isolation, Dynamics a Dynamics Processing, EQ a Parametric Equalizer, Enhance
+ //! Speech the Enhance Speech chain, Stereo Width the Stereo Width effect and Reverb a Studio
+ //! Reverb. These instances carry [`EffectInstance::essential`], appear in Effect Controls (where
+ //! their parameters can be keyframed) and render through the normal clip-effect path, so the
+@@ -152,6 +152,8 @@ pub struct Repair {
+     pub hum_hz: u32,
+     pub deess: Slot,
+     pub reverb: Slot,
++    /// Isolate Voice (Voice Isolation): keeps the dialogue, removes the rest.
++    pub isolate: Slot,
+ }
+ 
+ impl Default for Repair {
+@@ -164,6 +166,7 @@ impl Default for Repair {
+             hum_hz: 60,
+             deess: Slot::off(5.0),
+             reverb: Slot::off(5.0),
++            isolate: Slot::off(8.0),
+         }
+     }
+ }
+@@ -360,6 +363,7 @@ impl EssentialSound {
+             &mut self.repair.dehum,
+             &mut self.repair.deess,
+             &mut self.repair.reverb,
++            &mut self.repair.isolate,
+             &mut self.clarity.dynamics,
+             &mut self.clarity.eq,
+             &mut self.clarity.enhance,
+@@ -415,6 +419,9 @@ impl EssentialSound {
+             if r.rumble.on {
+                 push("highpass", r.enabled, &[("cutoff", f(rumble_cutoff(r.rumble.amount)))]);
+             }
++            if r.isolate.on {
++                push("voice_isolation", r.enabled, &[("amount", f(r.isolate.amount * 10.0))]);
++            }
+             if r.noise.on {
+                 push("denoise", r.enabled, &[("amount", f(r.noise.amount * 10.0))]);
+             }
+@@ -503,8 +510,19 @@ pub fn rumble_cutoff(amount: f64) -> f64 {
+ }
+ 
+ /// Canonical processing order of the effects Essential Sound manages.
+-pub const EFFECT_ORDER: &[&str] =
+-    &["highpass", "denoise", "dehummer", "deesser", "dereverb", "dynamics", "parametric_eq", "speech_enhance", "stereo_width", "studio_reverb"];
++pub const EFFECT_ORDER: &[&str] = &[
++    "highpass",
++    "voice_isolation",
++    "denoise",
++    "dehummer",
++    "deesser",
++    "dereverb",
++    "dynamics",
++    "parametric_eq",
++    "speech_enhance",
++    "stereo_width",
++    "studio_reverb",
++];
+ 
+ fn rank(id: &str) -> usize {
+     EFFECT_ORDER.iter().position(|e| *e == id).unwrap_or(EFFECT_ORDER.len())
+diff --git a/crates/render/src/audio_fx.rs b/crates/render/src/audio_fx.rs
+index db84a1f6c34261e5741a4979625d53ed922dcc8f..463c8b1af514b06f3037a67f3ce1bc1a298319a7 100644
+--- a/crates/render/src/audio_fx.rs
++++ b/crates/render/src/audio_fx.rs
+@@ -234,6 +234,8 @@ pub const DIRECT: &[(&str, &str, f64)] = &[
+     ("multitap_delay", "multitap_delay", 0.0),
+     ("convolution_reverb", "convolution_reverb", 0.0),
+     ("surround_reverb", "surround_reverb", 0.0),
++    // the noise tracker's 1.5 s minimum-statistics window
++    ("voice_isolation", "voice_isolation", 1.5),
+ ];
+ 
+ /// Pre-roll of a direct mapping: its own tail, and at least long enough for the DSP's
+diff --git a/crates/ui-egui/src/i18n/de.tsv b/crates/ui-egui/src/i18n/de.tsv
+index 76991909c764e06430b4fa929b2112ae50233a0f..647d019d7c7358e6a261363e102e6feea5da3081 100644
+--- a/crates/ui-egui/src/i18n/de.tsv
++++ b/crates/ui-egui/src/i18n/de.tsv
+@@ -3613,3 +3613,30 @@
+ 	Shows the version, community links and credits in a FilmCraft window.	Zeigt Version, Community-Links und Credits in einem FilmCraft-Fenster.
+ 	Couldn't open your web browser	Dein Webbrowser konnte nicht geöffnet werden
+ 	Open this address in your browser yourself:	Öffne diese Adresse selbst in deinem Browser:
++
++# Voice Isolation effect, its Fx Editor and Essential Sound ▸ Repair ▸ Isolate Voice
++	Voice Isolation	Stimmisolierung
++	Background Floor	Hintergrund-Untergrenze
++	Preserve Formants	Formanten erhalten
++	Center Focus	Mittenfokus
++	Isolated Voice	Isolierte Stimme
++	Removed Background	Entfernter Hintergrund
++	Isolate Voice	Stimme isolieren
++	Removed	Entfernt
++	Kept	Behalten
++	Original	Original
++	Voice detected: {pct} %	Stimme erkannt: {pct} %
++	Average gain: {db} dB	Mittlere Verstärkung: {db} dB
++	Pitch: {hz} Hz	Tonhöhe: {hz} Hz
++	Voice activity	Sprachaktivität
++	Presets:	Vorgaben:
++	Gentle	Sanft
++	Balanced	Ausgewogen
++	Strong	Stark
++	Music Bed	Musikbett
++	Listen:	Anhören:
++	No audio at the playhead.	Kein Audio an der Abspielposition.
++	No sequence is open.	Keine Sequenz geöffnet.
++	The clip is no longer in the sequence.	Der Clip ist nicht mehr in der Sequenz.
++	This clip has no audio to preview.	Dieser Clip hat kein Audio für die Vorschau.
++	The track is no longer in the sequence.	Die Spur ist nicht mehr in der Sequenz.
+diff --git a/crates/ui-egui/src/i18n/es.tsv b/crates/ui-egui/src/i18n/es.tsv
+index 2ac92decc16794584e9bf85af58a6af81864af4a..a89e13154e66cd188005e6413894bb9b193c0980 100644
+--- a/crates/ui-egui/src/i18n/es.tsv
++++ b/crates/ui-egui/src/i18n/es.tsv
+@@ -3617,3 +3617,30 @@
+ 	Open a sequence to search its graphics	Abre una secuencia para buscar en sus gráficos
+ 	No text graphics in this sequence. Add text with the Type tool.	Esta secuencia no tiene gráficos con texto. Añade texto con la herramienta Texto.
+ 	No matching text.	Ningún texto coincide.
++
++# Voice Isolation effect, its Fx Editor and Essential Sound ▸ Repair ▸ Isolate Voice
++	Voice Isolation	Aislamiento de voz
++	Background Floor	Suelo del fondo
++	Preserve Formants	Conservar formantes
++	Center Focus	Enfoque central
++	Isolated Voice	Voz aislada
++	Removed Background	Fondo eliminado
++	Isolate Voice	Aislar voz
++	Removed	Eliminado
++	Kept	Conservado
++	Original	Original
++	Voice detected: {pct} %	Voz detectada: {pct} %
++	Average gain: {db} dB	Ganancia media: {db} dB
++	Pitch: {hz} Hz	Tono: {hz} Hz
++	Voice activity	Actividad de voz
++	Presets:	Ajustes preestablecidos:
++	Gentle	Suave
++	Balanced	Equilibrado
++	Strong	Fuerte
++	Music Bed	Fondo musical
++	Listen:	Escuchar:
++	No audio at the playhead.	No hay audio en el cabezal.
++	No sequence is open.	No hay ninguna secuencia abierta.
++	The clip is no longer in the sequence.	El clip ya no está en la secuencia.
++	This clip has no audio to preview.	Este clip no tiene audio para previsualizar.
++	The track is no longer in the sequence.	La pista ya no está en la secuencia.
+diff --git a/crates/ui-egui/src/i18n/fr.tsv b/crates/ui-egui/src/i18n/fr.tsv
+index 6778b0322ec3c9219569c222c905d2e8f727e791..46ddc9202d811606ceef14156c80d5b54ff8d3ab 100644
+--- a/crates/ui-egui/src/i18n/fr.tsv
++++ b/crates/ui-egui/src/i18n/fr.tsv
+@@ -3584,3 +3584,30 @@
+ 	Open a sequence to search its graphics	Ouvrez une séquence pour rechercher dans ses graphiques
+ 	No text graphics in this sequence. Add text with the Type tool.	Aucun graphique avec du texte dans cette séquence. Ajoutez du texte avec l'outil Texte.
+ 	No matching text.	Aucun texte ne correspond.
++
++# Voice Isolation effect, its Fx Editor and Essential Sound ▸ Repair ▸ Isolate Voice
++	Voice Isolation	Isolation de la voix
++	Background Floor	Plancher de l'arrière-plan
++	Preserve Formants	Préserver les formants
++	Center Focus	Focalisation centrale
++	Isolated Voice	Voix isolée
++	Removed Background	Arrière-plan supprimé
++	Isolate Voice	Isoler la voix
++	Removed	Supprimé
++	Kept	Conservé
++	Original	Original
++	Voice detected: {pct} %	Voix détectée : {pct} %
++	Average gain: {db} dB	Gain moyen : {db} dB
++	Pitch: {hz} Hz	Hauteur : {hz} Hz
++	Voice activity	Activité vocale
++	Presets:	Préréglages :
++	Gentle	Doux
++	Balanced	Équilibré
++	Strong	Fort
++	Music Bed	Fond musical
++	Listen:	Écouter :
++	No audio at the playhead.	Aucun audio à la tête de lecture.
++	No sequence is open.	Aucune séquence n'est ouverte.
++	The clip is no longer in the sequence.	Le clip n'est plus dans la séquence.
++	This clip has no audio to preview.	Ce clip n'a pas d'audio à prévisualiser.
++	The track is no longer in the sequence.	La piste n'est plus dans la séquence.
+diff --git a/crates/ui-egui/src/i18n/id.tsv b/crates/ui-egui/src/i18n/id.tsv
+index 8ffc4f5b3be7097a1a89f5599762030f70ef9f1f..2d9b16830d5a7abb9a818f383de1b87651d830f5 100644
+--- a/crates/ui-egui/src/i18n/id.tsv
++++ b/crates/ui-egui/src/i18n/id.tsv
+@@ -3582,3 +3582,30 @@
+ 	Open a sequence to search its graphics	Buka sekuens untuk mencari di grafisnya
+ 	No text graphics in this sequence. Add text with the Type tool.	Tidak ada grafis teks di sekuens ini. Tambahkan teks dengan alat Teks.
+ 	No matching text.	Tidak ada teks yang cocok.
++
++# Voice Isolation effect, its Fx Editor and Essential Sound ▸ Repair ▸ Isolate Voice
++	Voice Isolation	Isolasi Suara
++	Background Floor	Batas Bawah Latar
++	Preserve Formants	Pertahankan Forman
++	Center Focus	Fokus Tengah
++	Isolated Voice	Suara Terisolasi
++	Removed Background	Latar yang Dihapus
++	Isolate Voice	Isolasi Suara Vokal
++	Removed	Dihapus
++	Kept	Dipertahankan
++	Original	Asli
++	Voice detected: {pct} %	Suara terdeteksi: {pct} %
++	Average gain: {db} dB	Gain rata-rata: {db} dB
++	Pitch: {hz} Hz	Nada: {hz} Hz
++	Voice activity	Aktivitas suara
++	Presets:	Preset:
++	Gentle	Lembut
++	Balanced	Seimbang
++	Strong	Kuat
++	Music Bed	Latar Musik
++	Listen:	Dengarkan:
++	No audio at the playhead.	Tidak ada audio di kepala putar.
++	No sequence is open.	Tidak ada sekuens yang terbuka.
++	The clip is no longer in the sequence.	Klip sudah tidak ada di sekuens.
++	This clip has no audio to preview.	Klip ini tidak memiliki audio untuk dipratinjau.
++	The track is no longer in the sequence.	Trek sudah tidak ada di sekuens.
+diff --git a/crates/ui-egui/src/i18n/it.tsv b/crates/ui-egui/src/i18n/it.tsv
+index ef02460c3b5c8a8f2838336f053ebf77274e2013..00dc3e252fcb281db65ce9bde47a8d221577a123 100644
+--- a/crates/ui-egui/src/i18n/it.tsv
++++ b/crates/ui-egui/src/i18n/it.tsv
+@@ -3608,3 +3608,30 @@
+ 	Open a sequence to search its graphics	Apri una sequenza per cercare nelle sue grafiche
+ 	No text graphics in this sequence. Add text with the Type tool.	Nessuna grafica con testo in questa sequenza. Aggiungi testo con lo strumento Testo.
+ 	No matching text.	Nessun testo corrispondente.
++
++# Voice Isolation effect, its Fx Editor and Essential Sound ▸ Repair ▸ Isolate Voice
++	Voice Isolation	Isolamento della voce
++	Background Floor	Soglia dello sfondo
++	Preserve Formants	Preserva formanti
++	Center Focus	Focus centrale
++	Isolated Voice	Voce isolata
++	Removed Background	Sfondo rimosso
++	Isolate Voice	Isola voce
++	Removed	Rimosso
++	Kept	Mantenuto
++	Original	Originale
++	Voice detected: {pct} %	Voce rilevata: {pct} %
++	Average gain: {db} dB	Guadagno medio: {db} dB
++	Pitch: {hz} Hz	Intonazione: {hz} Hz
++	Voice activity	Attività vocale
++	Presets:	Predefiniti:
++	Gentle	Delicato
++	Balanced	Bilanciato
++	Strong	Forte
++	Music Bed	Base musicale
++	Listen:	Ascolta:
++	No audio at the playhead.	Nessun audio all'indicatore di riproduzione.
++	No sequence is open.	Nessuna sequenza aperta.
++	The clip is no longer in the sequence.	La clip non è più nella sequenza.
++	This clip has no audio to preview.	Questa clip non ha audio da visualizzare in anteprima.
++	The track is no longer in the sequence.	La traccia non è più nella sequenza.
+diff --git a/crates/ui-egui/src/i18n/ja.tsv b/crates/ui-egui/src/i18n/ja.tsv
+index d0fb3d4e727094d45e9a12d62e388f965b3ebe2a..033310937cb384b03991e1b7742f173c2f49f9ec 100644
+--- a/crates/ui-egui/src/i18n/ja.tsv
++++ b/crates/ui-egui/src/i18n/ja.tsv
+@@ -3616,3 +3616,30 @@
+ 	Open a sequence to search its graphics	シーケンスを開くとグラフィックスを検索できます
+ 	No text graphics in this sequence. Add text with the Type tool.	このシーケンスにはテキストのグラフィックスがありません。文字ツールでテキストを追加してください。
+ 	No matching text.	一致するテキストはありません。
++
++# Voice Isolation effect, its Fx Editor and Essential Sound ▸ Repair ▸ Isolate Voice
++	Voice Isolation	ボイスアイソレーション
++	Background Floor	背景の下限
++	Preserve Formants	フォルマントを保持
++	Center Focus	センターフォーカス
++	Isolated Voice	分離した音声
++	Removed Background	除去した背景
++	Isolate Voice	音声を分離
++	Removed	除去
++	Kept	保持
++	Original	元の音声
++	Voice detected: {pct} %	音声検出: {pct} %
++	Average gain: {db} dB	平均ゲイン: {db} dB
++	Pitch: {hz} Hz	ピッチ: {hz} Hz
++	Voice activity	音声アクティビティ
++	Presets:	プリセット:
++	Gentle	ソフト
++	Balanced	バランス
++	Strong	強め
++	Music Bed	音楽ベッド
++	Listen:	試聴:
++	No audio at the playhead.	再生ヘッドの位置にオーディオがありません。
++	No sequence is open.	開いているシーケンスがありません。
++	The clip is no longer in the sequence.	クリップはシーケンスにありません。
++	This clip has no audio to preview.	このクリップにはプレビューできるオーディオがありません。
++	The track is no longer in the sequence.	トラックはシーケンスにありません。
+diff --git a/crates/ui-egui/src/i18n/ko.tsv b/crates/ui-egui/src/i18n/ko.tsv
+index 73d5adf68cb336a139ec0a16697fe66ea4f06879..1dfc36b9ddbc10c52be6585fda5d178e5d06d421 100644
+--- a/crates/ui-egui/src/i18n/ko.tsv
++++ b/crates/ui-egui/src/i18n/ko.tsv
+@@ -3603,3 +3603,30 @@
+ 	Open a sequence to search its graphics	그래픽을 검색하려면 시퀀스를 여세요
+ 	No text graphics in this sequence. Add text with the Type tool.	이 시퀀스에는 텍스트 그래픽이 없습니다. 문자 도구로 텍스트를 추가하세요.
+ 	No matching text.	일치하는 텍스트가 없습니다.
++
++# Voice Isolation effect, its Fx Editor and Essential Sound ▸ Repair ▸ Isolate Voice
++	Voice Isolation	음성 분리
++	Background Floor	배경 하한
++	Preserve Formants	포먼트 유지
++	Center Focus	센터 포커스
++	Isolated Voice	분리된 음성
++	Removed Background	제거된 배경
++	Isolate Voice	음성 분리하기
++	Removed	제거됨
++	Kept	유지됨
++	Original	원본
++	Voice detected: {pct} %	음성 감지: {pct} %
++	Average gain: {db} dB	평균 게인: {db} dB
++	Pitch: {hz} Hz	피치: {hz} Hz
++	Voice activity	음성 활동
++	Presets:	사전 설정:
++	Gentle	부드럽게
++	Balanced	균형
++	Strong	강하게
++	Music Bed	배경 음악
++	Listen:	듣기:
++	No audio at the playhead.	재생 헤드 위치에 오디오가 없습니다.
++	No sequence is open.	열린 시퀀스가 없습니다.
++	The clip is no longer in the sequence.	클립이 더 이상 시퀀스에 없습니다.
++	This clip has no audio to preview.	이 클립에는 미리 볼 오디오가 없습니다.
++	The track is no longer in the sequence.	트랙이 더 이상 시퀀스에 없습니다.
+diff --git a/crates/ui-egui/src/i18n/pt-br.tsv b/crates/ui-egui/src/i18n/pt-br.tsv
+index 7cbb49a58e722ffee9c1400e133f74cd5af4c60f..76c8df9aa124da3ce2f287f4ff3d6117f99444fe 100644
+--- a/crates/ui-egui/src/i18n/pt-br.tsv
++++ b/crates/ui-egui/src/i18n/pt-br.tsv
+@@ -3585,3 +3585,30 @@
+ 	Open a sequence to search its graphics	Abra uma sequência para pesquisar nos gráficos dela
+ 	No text graphics in this sequence. Add text with the Type tool.	Esta sequência não tem gráficos com texto. Adicione texto com a ferramenta Texto.
+ 	No matching text.	Nenhum texto corresponde.
++
++# Voice Isolation effect, its Fx Editor and Essential Sound ▸ Repair ▸ Isolate Voice
++	Voice Isolation	Isolamento de voz
++	Background Floor	Piso do fundo
++	Preserve Formants	Preservar formantes
++	Center Focus	Foco central
++	Isolated Voice	Voz isolada
++	Removed Background	Fundo removido
++	Isolate Voice	Isolar voz
++	Removed	Removido
++	Kept	Mantido
++	Original	Original
++	Voice detected: {pct} %	Voz detectada: {pct} %
++	Average gain: {db} dB	Ganho médio: {db} dB
++	Pitch: {hz} Hz	Tom: {hz} Hz
++	Voice activity	Atividade de voz
++	Presets:	Predefinições:
++	Gentle	Suave
++	Balanced	Equilibrado
++	Strong	Forte
++	Music Bed	Trilha de fundo
++	Listen:	Ouvir:
++	No audio at the playhead.	Nenhum áudio no cursor de reprodução.
++	No sequence is open.	Nenhuma sequência aberta.
++	The clip is no longer in the sequence.	O clipe não está mais na sequência.
++	This clip has no audio to preview.	Este clipe não tem áudio para visualizar.
++	The track is no longer in the sequence.	A trilha não está mais na sequência.
+diff --git a/crates/ui-egui/src/i18n/zh-cn.tsv b/crates/ui-egui/src/i18n/zh-cn.tsv
+index 244646f475cf82a0149f0e84666b8349b7e4f15e..c4011f83f3eeb1c4a7bd2ff6a5b9cb19fcb99318 100644
+--- a/crates/ui-egui/src/i18n/zh-cn.tsv
++++ b/crates/ui-egui/src/i18n/zh-cn.tsv
+@@ -3592,3 +3592,30 @@
+ 	Open a sequence to search its graphics	打开序列以搜索其中的图形
+ 	No text graphics in this sequence. Add text with the Type tool.	此序列中没有文本图形。请用文字工具添加文本。
+ 	No matching text.	没有匹配的文本。
++
++# Voice Isolation effect, its Fx Editor and Essential Sound ▸ Repair ▸ Isolate Voice
++	Voice Isolation	人声分离
++	Background Floor	背景下限
++	Preserve Formants	保留共振峰
++	Center Focus	中置聚焦
++	Isolated Voice	分离的人声
++	Removed Background	移除的背景
++	Isolate Voice	分离人声
++	Removed	已移除
++	Kept	已保留
++	Original	原始
++	Voice detected: {pct} %	检测到人声：{pct} %
++	Average gain: {db} dB	平均增益：{db} dB
++	Pitch: {hz} Hz	音高：{hz} Hz
++	Voice activity	人声活动
++	Presets:	预设：
++	Gentle	轻柔
++	Balanced	均衡
++	Strong	强力
++	Music Bed	音乐背景
++	Listen:	监听：
++	No audio at the playhead.	播放头处没有音频。
++	No sequence is open.	没有打开的序列。
++	The clip is no longer in the sequence.	剪辑已不在序列中。
++	This clip has no audio to preview.	此剪辑没有可预览的音频。
++	The track is no longer in the sequence.	轨道已不在序列中。
+diff --git a/crates/ui-egui/src/panels/audio_fx_editor.rs b/crates/ui-egui/src/panels/audio_fx_editor.rs
+index ba86d691a894c27cdc3d4dd912ae038a5bb529e6..4e57b336e39b1e84a2e0f230437cc7933cc92ec7 100644
+--- a/crates/ui-egui/src/panels/audio_fx_editor.rs
++++ b/crates/ui-egui/src/panels/audio_fx_editor.rs
+@@ -1,7 +1,7 @@
+ //! Clip / Track Fx Editor windows: graphical editors for the audio effects that need one
+ //! (Parametric Equalizer curve, Graphic Equalizer 10/20/30 bands, Multiband Compressor,
+-//! Dynamics). Opened from Effect Controls ("Custom Setup ▸ Edit…") and from a track's effect
+-//! slot in the Audio Track Mixer.
++//! Dynamics, Voice Isolation). Opened from Effect Controls ("Custom Setup ▸ Edit…") and from a
++//! track's effect slot in the Audio Track Mixer.
+ //!
+ //! Curves are computed by the real DSP (`render::audio_fx::configured` →
+ //! `AudioEffect::response_db` / `transfer_db`), so what is drawn is what is heard. Drags preview
+@@ -10,12 +10,17 @@
+ //! Automation ids (`<fx>` = effect id): `fxEditor.<fx>.plot`, `fxEditor.<fx>.node.<band>` (EQ
+ //! nodes: hp, low, b1, b2, mid, b4, b5, high, lp), `fxEditor.<fx>.toggle.<param>` (on/off,
+ //! solo, bypass…), `fxEditor.<fx>.param.<param>` (sliders), `fxEditor.<fx>.xo1…3` (crossover
+-//! handles), `fxEditor.<fx>.reset`, `fxEditor.<fx>.close`.
++//! handles), `fxEditor.<fx>.reset`, `fxEditor.<fx>.close`. Voice Isolation adds
++//! `fxEditor.voice_isolation.view` (before/after plot), `.voice` (voice-activity strip),
++//! `.preset.<gentle|balanced|strong|music>` and `.listen.<0|1>`.
+ 
+ use std::collections::HashMap;
++use std::sync::Arc;
+ 
+ use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, pos2, vec2};
+-use filmcraft_project::{ClipId, EffectInstance, ParamKind, ParamValue, TrackId};
++use filmcraft_audio_dsp::AudioEffect;
++use filmcraft_audio_dsp::effects::VoiceIsolator;
++use filmcraft_project::{ClipId, EffectInstance, ParamKind, ParamValue, Sequence, TrackId};
+ use filmcraft_time::Tick;
+ use serde::{Deserialize, Serialize};
+ use serde_json::{Value, json};
+@@ -34,7 +39,7 @@ pub enum FxTarget {
+ 
+ /// Effects that have a graphical editor.
+ pub fn has_editor(effect: &str) -> bool {
+-    matches!(effect, "parametric_eq" | "graphic_eq" | "graphic_eq_20" | "graphic_eq_30" | "multiband_compressor" | "dynamics_rack")
++    matches!(effect, "parametric_eq" | "graphic_eq" | "graphic_eq_20" | "graphic_eq_30" | "multiband_compressor" | "dynamics_rack" | "voice_isolation")
+ }
+ 
+ /// Open (or raise) the editor for a target.
+@@ -106,9 +111,17 @@ impl Ed<'_> {
+             _ => (0.0, 1.0, ""),
+         }
+     }
++    /// `v` as the JSON value `effects.setParam` expects for the parameter's kind (a choice takes an
++    /// integer index, not a float).
++    fn json_value(&self, pid: &str, v: f64) -> Value {
++        match self.inst.def().and_then(|d| d.param(pid)).map(|p| &p.kind) {
++            Some(ParamKind::Bool) => json!(v >= 0.5),
++            Some(ParamKind::Choice(_)) => json!(v.round().max(0.0) as u64),
++            _ => json!(v),
++        }
++    }
+     fn commit(&mut self, pid: &str, v: f64) {
+-        let is_bool = matches!(self.inst.def().and_then(|d| d.param(pid)).map(|p| &p.kind), Some(ParamKind::Bool));
+-        let val = if is_bool { json!(v >= 0.5) } else { json!(v) };
++        let val = self.json_value(pid, v);
+         self.acts.push(set_cmd(self.target, pid, val));
+         // keep showing the new value until the project catches up this frame
+         self.drafts.insert(pid.to_string(), v);
+@@ -126,6 +139,26 @@ impl Ed<'_> {
+             }
+         }
+     }
++    /// Commit several parameters as one undo step (presets, reset).
++    fn commit_many(&mut self, values: &[(&str, f64)]) {
++        let typed = |ed: &Self, pid: &str, v: f64| ed.json_value(pid, v);
++        match self.target {
++            FxTarget::Clip { clip, index } => {
++                for (i, (pid, v)) in values.iter().enumerate() {
++                    let val = typed(self, pid, *v);
++                    let p = json!({"clip": clip, "effect": index, "param": pid, "value": val, "merge": "fxEditorPreset", "begin": i == 0});
++                    self.acts.push(("effects.setParam".into(), p));
++                }
++            }
++            FxTarget::Insert { strip, slot } => {
++                let params: serde_json::Map<String, Value> = values.iter().map(|(pid, v)| (pid.to_string(), typed(self, pid, *v))).collect();
++                self.acts.push(("mixer.setInsert".into(), json!({"strip": strip, "slot": slot, "params": params})));
++            }
++        }
++        for (pid, v) in values {
++            self.drafts.insert(pid.to_string(), *v);
++        }
++    }
+     fn auto(&mut self, id: String, r: Rect, label: &str) {
+         self.autos.push((id, r, label.to_string()));
+     }
+@@ -195,6 +228,7 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
+         let drafts: HashMap<String, f64> = ctx.data(|d| d.get_temp(drafts_id)).unwrap_or_default();
+         let fx_id = inst.effect.clone();
+         let mut ed = Ed { t: app.tokens, fx: &fx_id, target: &target, inst, mt, drafts, acts: Vec::new(), autos: Vec::new() };
++        let view = (fx_id == "voice_isolation").then(|| voice_view(app, ctx, &target, &ed));
+         let mut open = true;
+         let mut closed = false;
+         egui::Window::new(title).id(egui::Id::new(("fx-editor", &k))).open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+@@ -202,6 +236,7 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
+                 "parametric_eq" => parametric(ui, &mut ed),
+                 "graphic_eq" | "graphic_eq_20" | "graphic_eq_30" => graphic(ui, &mut ed),
+                 "multiband_compressor" => multiband(ui, &mut ed),
++                "voice_isolation" => voice(ui, &mut ed, view.as_ref().map(|(v, at)| (v.as_ref(), *at))),
+                 _ => dynamics(ui, &mut ed),
+             }
+             ui.separator();
+@@ -221,8 +256,10 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
+                 p.get("param")
+                     .and_then(Value::as_str)
+                     .map(str::to_string)
+-                    .or_else(|| p.get("params").and_then(Value::as_object).and_then(|o| o.keys().next().cloned()))
++                    .map(|k| vec![k])
++                    .or_else(|| p.get("params").and_then(Value::as_object).map(|o| o.keys().cloned().collect()))
+             })
++            .flatten()
+             .collect();
+         let mut keep = ed.drafts.clone();
+         for c in &committed {
+@@ -554,3 +591,283 @@ fn dynamics(ui: &mut egui::Ui, ed: &mut Ed) {
+         });
+     });
+ }
++
++// --------------------------------------------------------------------- voice isolation
++
++/// Length of the before/after window around the playhead (s), the analysis pre-roll before it
++/// (the noise tracker's warm-up) and the number of plot columns.
++const VOICE_VIEW_S: f64 = 3.0;
++const VOICE_PREROLL_S: f64 = 1.5;
++const VOICE_COLS: usize = 330;
++
++/// What the Voice Isolation effect does around the playhead: the effect's input and output
++/// envelopes, the voice-activity estimate and summary numbers, computed by the real DSP.
++#[derive(Clone, Debug, Default)]
++struct VoiceView {
++    /// Peak envelope per column (max |x| over the channels) of the input and output.
++    input: Vec<f32>,
++    output: Vec<f32>,
++    /// Speech-presence probability per column (0…1).
++    voice: Vec<f32>,
++    /// Window start and length in sequence samples.
++    start: i64,
++    len: usize,
++    /// Share of the window detected as voice, mean gain (dB) and median pitch (Hz, 0: none).
++    voiced_share: f32,
++    gain_db: f32,
++    pitch_hz: f32,
++    /// Why there is nothing to show (an English `tl!` key).
++    note: Option<&'static str>,
++}
++
++/// Presets: (automation suffix, label, amount, sensitivity, floor, center focus).
++const VOICE_PRESETS: [(&str, &str, f64, f64, f64, f64); 4] = [
++    ("gentle", "Gentle", 60.0, 45.0, -30.0, 15.0),
++    ("balanced", "Balanced", 85.0, 65.0, -48.0, 30.0),
++    ("strong", "Strong", 100.0, 85.0, -70.0, 40.0),
++    ("music", "Music Bed", 100.0, 90.0, -60.0, 70.0),
++];
++
++/// The view for an editor and the playhead's place in it (0…1, `None` outside). Cached by
++/// (target, project revision, window, settings) and recomputed only while no drag is in progress
++/// and playback is stopped, so editing and playback stay smooth.
++fn voice_view(app: &FilmcraftApp, ctx: &egui::Context, target: &FxTarget, ed: &Ed) -> (Arc<VoiceView>, Option<f32>) {
++    let id = egui::Id::new(("fx-editor-voice-view", key(target)));
++    let cached: Option<(String, Arc<VoiceView>)> = ctx.data(|d| d.get_temp(id));
++    let Some(seq) = app.session.active_sequence() else {
++        return (Arc::new(VoiceView { note: Some("No sequence is open."), ..VoiceView::default() }), None);
++    };
++    let sr = seq.settings.sample_rate.clamp(8000, 384_000);
++    let ph = app.session.playhead().to_units_floor(i64::from(sr));
++    let len = (VOICE_VIEW_S * f64::from(sr)) as usize;
++    // window start on a half-second grid, so small playhead moves don't recompute
++    let half = i64::from(sr / 2).max(1);
++    let start = (ph - len as i64 / 2).div_euclid(half) * half;
++    let preview = ed.preview();
++    let settings: Vec<String> = VoiceIsolator::PARAMS.iter().map(|p| format!("{:.3}", preview.f64_at(p.id, ed.mt))).collect();
++    let k = format!("{}|{}|{start}|{sr}|{}", key(target), app.session.revision, settings.join(","));
++    let view = match cached {
++        Some((ck, v)) if ck == k || !ed.drafts.is_empty() || app.playback.playing => v,
++        _ => {
++            let v = Arc::new(compute_voice_view(app, seq, target, &preview, ed.mt, start, len, sr));
++            ctx.data_mut(|d| d.insert_temp(id, (k, v.clone())));
++            v
++        }
++    };
++    let at = (ph - view.start) as f64 / view.len.max(1) as f64;
++    let at = (view.len > 0 && (0.0..=1.0).contains(&at)).then_some(at as f32);
++    (view, at)
++}
++
++fn compute_voice_view(app: &FilmcraftApp, seq: &Sequence, target: &FxTarget, inst: &EffectInstance, mt: Tick, start: i64, len: usize, sr: u32) -> VoiceView {
++    let none = |note| VoiceView { start, len, note: Some(note), ..VoiceView::default() };
++    let pre = (VOICE_PREROLL_S * f64::from(sr)) as usize;
++    let mut fx = VoiceIsolator::new(sr as f32, 2);
++    for p in VoiceIsolator::PARAMS {
++        fx.set_param(p.id, inst.f64_at(p.id, mt) as f32);
++    }
++    let lat = fx.latency();
++    let total = pre + len + lat;
++    let x0 = start - pre as i64;
++    let provider = app.session.media.provider(app.session.project.clone(), app.session.services.clone());
++    let mut chans: Vec<Vec<f32>> = match target {
++        FxTarget::Clip { clip, index } => {
++            let Some((_, it)) = seq.find_item(ClipId(*clip)) else { return none("The clip is no longer in the sequence.") };
++            // the effect's input: the clip with only the effects before this one
++            let mut src = it.clone();
++            src.effects.truncate(*index);
++            match filmcraft_render::audio::clip_signal(&src, x0, total, sr, &provider) {
++                Some([l, r]) => vec![l, r],
++                None => return none("This clip has no audio to preview."),
++            }
++        }
++        FxTarget::Insert { strip, .. } => {
++            let Some(tr) = seq.strip(TrackId(*strip)) else { return none("The track is no longer in the sequence.") };
++            filmcraft_render::audio::track_input(&app.session.project, &tr, x0, total, sr, &provider).channels.into_iter().take(2).collect()
++        }
++    };
++    if let [only] = chans.as_slice() {
++        chans.push(only.clone());
++    }
++    if chans.len() != 2 || chans.iter().any(|c| c.len() < total) {
++        return none("This clip has no audio to preview.");
++    }
++    let input: Vec<Vec<f32>> = chans.iter().map(|c| c.get(pre..pre + len).unwrap_or(&[]).to_vec()).collect();
++    if input.iter().flatten().all(|v| *v == 0.0) {
++        return none("No audio at the playhead.");
++    }
++    // process in blocks, sampling the meter (it describes the frame output `lat` samples ago)
++    const BLOCK: usize = 256;
++    let cols = VOICE_COLS;
++    let mut voice = vec![0.0f32; cols];
++    let mut voice_n = vec![0u32; cols];
++    let (mut gain_sum, mut reads, mut voiced) = (0.0f64, 0u32, 0u32);
++    let mut pitches = Vec::new();
++    let mut pos = 0usize;
++    while pos < total {
++        let end = (pos + BLOCK).min(total);
++        let mut refs: Vec<&mut [f32]> = chans.iter_mut().filter_map(|c| c.get_mut(pos..end)).collect();
++        fx.process(&mut refs);
++        pos = end;
++        let at = pos as i64 - lat as i64 - pre as i64;
++        if at < 0 || at as usize >= len {
++            continue;
++        }
++        let m = fx.meter();
++        let c = (at as usize * cols / len.max(1)).min(cols - 1);
++        voice[c] += m.voice;
++        voice_n[c] += 1;
++        gain_sum += f64::from(m.reduction_db);
++        reads += 1;
++        voiced += u32::from(m.voice > 0.5);
++        if m.pitch_hz > 0.0 {
++            pitches.push(m.pitch_hz);
++        }
++    }
++    for (v, n) in voice.iter_mut().zip(&voice_n) {
++        if *n > 0 {
++            *v /= *n as f32;
++        }
++    }
++    let output: Vec<Vec<f32>> = chans.iter().map(|c| c.get(pre + lat..pre + lat + len).unwrap_or(&[]).to_vec()).collect();
++    let env = |sig: &[Vec<f32>]| -> Vec<f32> {
++        (0..cols)
++            .map(|c| {
++                let (a, b) = (c * len / cols, ((c + 1) * len / cols).min(len));
++                sig.iter().flat_map(|ch| ch.get(a..b).unwrap_or(&[])).fold(0.0f32, |m, v| if v.is_finite() { m.max(v.abs()) } else { m })
++            })
++            .collect()
++    };
++    pitches.sort_by(f32::total_cmp);
++    VoiceView {
++        input: env(&input),
++        output: env(&output),
++        voice,
++        start,
++        len,
++        voiced_share: if reads > 0 { voiced as f32 / reads as f32 } else { 0.0 },
++        gain_db: if reads > 0 { (gain_sum / f64::from(reads)) as f32 } else { 0.0 },
++        pitch_hz: pitches.get(pitches.len() / 2).copied().unwrap_or(0.0),
++        note: None,
++    }
++}
++
++/// The Voice Isolation editor: before/after view with the voice-activity strip, presets, the
++/// listen switch and every setting.
++fn voice(ui: &mut egui::Ui, ed: &mut Ed, view: Option<(&VoiceView, Option<f32>)>) {
++    let t = ed.t;
++    let background = ed.v("listen") >= 0.5;
++    let kept_col = if background { Color32::from_rgb(0xf0, 0x9a, 0x3e) } else { Color32::from_rgb(0x4d, 0xa3, 0xff) };
++    let voice_col = Color32::from_rgb(0x3f, 0xb9, 0x50);
++    // ---- before / after plot and the voice-activity strip under it
++    let (r, _) = ui.allocate_exact_size(vec2(660.0, 150.0), Sense::hover());
++    let p = ui.painter_at(r);
++    p.rect_filled(r, 2.0, t.plot_bg);
++    p.line_segment([pos2(r.min.x, r.center().y), pos2(r.max.x, r.center().y)], Stroke::new(1.0, t.plot_grid));
++    let (vr, _) = ui.allocate_exact_size(vec2(660.0, 10.0), Sense::hover());
++    ui.painter().rect_filled(vr, 1.0, t.plot_bg);
++    let stats = match view {
++        Some((v, playhead)) if v.note.is_none() => {
++            let cols = v.input.len().min(v.output.len()).min(v.voice.len()).max(1);
++            let w = r.width() / cols as f32;
++            // one scale for both: the louder envelope fills 90 % of the half-height
++            let peak = v.input.iter().chain(&v.output).fold(1e-6f32, |m, x| m.max(*x));
++            let h = r.height() * 0.45 / peak;
++            let dim = t.text_faint.gamma_multiply(0.6);
++            for c in 0..cols {
++                let x = r.min.x + (c as f32 + 0.5) * w;
++                let (a, b) = (v.input.get(c).copied().unwrap_or(0.0), v.output.get(c).copied().unwrap_or(0.0));
++                p.line_segment([pos2(x, r.center().y - a * h), pos2(x, r.center().y + a * h)], Stroke::new(w.max(1.0), dim));
++                p.line_segment([pos2(x, r.center().y - b * h), pos2(x, r.center().y + b * h)], Stroke::new((w * 0.6).max(1.0), kept_col));
++                let a = v.voice.get(c).copied().unwrap_or(0.0).clamp(0.0, 1.0);
++                if a > 0.02 {
++                    let cell = Rect::from_min_max(pos2(vr.min.x + c as f32 * w, vr.min.y), pos2(vr.min.x + (c + 1) as f32 * w, vr.max.y));
++                    ui.painter().rect_filled(cell, 0.0, voice_col.gamma_multiply(a));
++                }
++            }
++            if let Some(f) = playhead {
++                let x = r.min.x + f * r.width();
++                ui.painter().line_segment([pos2(x, r.min.y), pos2(x, vr.max.y)], Stroke::new(1.0, t.focus));
++            }
++            let label = if background { tl!("Removed") } else { tl!("Kept") };
++            p.text(pos2(r.min.x + 6.0, r.min.y + 4.0), Align2::LEFT_TOP, format!("■ {}", tl!("Original")), Tokens::ui(10.5), t.text_dim);
++            p.text(pos2(r.min.x + 100.0, r.min.y + 4.0), Align2::LEFT_TOP, format!("■ {label}"), Tokens::ui(10.5), kept_col);
++            Some((v.voiced_share, v.gain_db, v.pitch_hz))
++        }
++        Some((v, _)) => {
++            let note = v.note.map_or(tl!("No audio at the playhead."), crate::i18n::t);
++            p.text(r.center(), Align2::CENTER_CENTER, note, Tokens::ui(12.0), t.text_faint);
++            None
++        }
++        None => None,
++    };
++    ed.auto(format!("fxEditor.{}.view", ed.fx), r, "Before / After");
++    ed.auto(format!("fxEditor.{}.voice", ed.fx), vr, "Voice Activity");
++    ui.horizontal(|ui| {
++        ui.colored_label(voice_col, "■");
++        match stats {
++            Some((share, gain, pitch)) => {
++                ui.label(tlf!("Voice detected: {pct} %", pct = format!("{:.0}", share * 100.0)));
++                ui.separator();
++                ui.label(tlf!("Average gain: {db} dB", db = format!("{gain:+.1}")));
++                if pitch > 0.0 {
++                    ui.separator();
++                    ui.label(tlf!("Pitch: {hz} Hz", hz = format!("{pitch:.0}")));
++                }
++            }
++            None => {
++                ui.label(tl!("Voice activity"));
++            }
++        }
++    });
++    ui.add_space(4.0);
++    // ---- presets and the listen switch
++    ui.horizontal(|ui| {
++        ui.label(tl!("Presets:"));
++        for (id, label, amount, sens, floor, centre) in VOICE_PRESETS {
++            let label = crate::i18n::t(label);
++            let near = |pid: &str, v: f64| (ed.v(pid) - v).abs() < 0.5;
++            let active = near("amount", amount) && near("sensitivity", sens) && near("floor", floor) && near("center_focus", centre);
++            let r = ui.selectable_label(active, label);
++            ed.auto(format!("fxEditor.{}.preset.{id}", ed.fx), r.rect, label);
++            if r.clicked() {
++                ed.commit_many(&[("amount", amount), ("sensitivity", sens), ("floor", floor), ("center_focus", centre)]);
++            }
++        }
++        ui.separator();
++        ui.label(tl!("Listen:"));
++        for (i, opt) in filmcraft_project::effect::VOICE_ISOLATION_OUTPUTS.iter().enumerate() {
++            let label = crate::i18n::t(opt);
++            let r = ui.selectable_label(usize::from(background) == i, label);
++            ed.auto(format!("fxEditor.{}.listen.{i}", ed.fx), r.rect, label);
++            if r.clicked() {
++                ed.commit("listen", i as f64);
++            }
++        }
++    });
++    ui.separator();
++    // ---- settings
++    ui.horizontal_top(|ui| {
++        ui.vertical(|ui| {
++            ui.set_width(325.0);
++            ed.slider(ui, "amount", tl!("Amount"), false);
++            ed.slider(ui, "sensitivity", tl!("Sensitivity"), false);
++            ed.slider(ui, "floor", tl!("Background Floor"), false);
++        });
++        ui.vertical(|ui| {
++            ui.set_width(325.0);
++            ed.slider(ui, "center_focus", tl!("Center Focus"), false);
++            ed.slider(ui, "output", tl!("Output Gain"), false);
++            ui.horizontal(|ui| {
++                ed.toggle(ui, "preserve_formants", tl!("Preserve Formants"));
++                let r = ui.button(tl!("Reset"));
++                ed.auto(format!("fxEditor.{}.reset", ed.fx), r.rect, "Reset");
++                if r.clicked() {
++                    let defaults: Vec<(&str, f64)> =
++                        ed.inst.def().map(|d| d.params.iter().filter_map(|p| p.default.as_f64().map(|v| (p.id, v))).collect()).unwrap_or_default();
++                    ed.commit_many(&defaults);
++                }
++            });
++        });
++    });
++}
+diff --git a/crates/ui-egui/src/panels/essential_sound.rs b/crates/ui-egui/src/panels/essential_sound.rs
+index 958594db3176e0c6d5764f43913598ff52ba7f55..dbce7fb02962aa3bea6e299fa1114cd1ef5dea06 100644
+--- a/crates/ui-egui/src/panels/essential_sound.rs
++++ b/crates/ui-egui/src/panels/essential_sound.rs
+@@ -276,6 +276,7 @@ fn typed_body(ui: &mut egui::Ui, cx: &mut Ctx, st: &EssentialSound, items: &[Tra
+             match sec {
+                 Section::Loudness => loudness(ui, cx, st, items),
+                 Section::Repair => {
++                    slot(ui, cx, tl!("Isolate Voice"), "repair.isolate", st.repair.isolate, on);
+                     slot(ui, cx, tl!("Reduce Noise"), "repair.noise", st.repair.noise, on);
+                     slot(ui, cx, tl!("Reduce Rumble"), "repair.rumble", st.repair.rumble, on);
+                     slot(ui, cx, tl!("DeHum"), "repair.dehum", st.repair.dehum, on);
+diff --git a/crates/ui-egui/tests/voice_isolation_ui.rs b/crates/ui-egui/tests/voice_isolation_ui.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..f9a9f6ed6ecc14af69b8a95229976e738ae666b8
+--- /dev/null
++++ b/crates/ui-egui/tests/voice_isolation_ui.rs
+@@ -0,0 +1,255 @@
++//! Headless UI tests of Voice Isolation: its Clip Fx Editor (before/after view, presets, listen
++//! switch, sliders, reset) opened from Effect Controls, its Track Fx Editor opened from a mixer
++//! slot, and Essential Sound ▸ Repair ▸ Isolate Voice.
++//!
++//! Set `FILMCRAFT_UI_SNAPSHOT_DIR=<dir>` to also write PNGs of the windows (`voice-isolation-*.png`).
++
++use std::sync::mpsc::{Sender, channel};
++
++use egui_kittest::Harness;
++use filmcraft_engine::Session;
++use filmcraft_ui_egui::FilmcraftApp;
++use filmcraft_ui_egui::control::ControlRequest;
++use serde_json::{Value, json};
++
++struct Driver {
++    harness: Harness<'static, FilmcraftApp>,
++    tx: Sender<ControlRequest>,
++    snapshots: Option<std::path::PathBuf>,
++}
++
++impl Driver {
++    fn demo() -> Self {
++        let mut session = Session::default();
++        session.execute("file.openDemoProject", json!({})).expect("demo project");
++        let (tx, rx) = channel();
++        let app = FilmcraftApp::new(session).with_control(rx);
++        let snapshots = std::env::var_os("FILMCRAFT_UI_SNAPSHOT_DIR").map(std::path::PathBuf::from);
++        let mut b = Harness::builder().with_size(egui::vec2(1600.0, 980.0)).with_max_steps(10_000);
++        if snapshots.is_some() {
++            b = b.wgpu();
++        }
++        let harness = b.build_eframe(move |_cc| app);
++        let mut d = Driver { harness, tx, snapshots };
++        d.frames(4);
++        d
++    }
++
++    fn frames(&mut self, n: usize) {
++        for _ in 0..n {
++            let ctx = self.harness.ctx.clone();
++            let mut raw = std::mem::take(self.harness.input_mut());
++            eframe::App::raw_input_hook(self.harness.state_mut(), &ctx, &mut raw);
++            *self.harness.input_mut() = raw;
++            self.harness.step();
++        }
++    }
++
++    fn call(&mut self, method: &str, params: Value) -> Value {
++        let (req, reply) = ControlRequest::new(method, params.clone());
++        self.tx.send(req).unwrap();
++        for _ in 0..600 {
++            self.frames(1);
++            if let Ok(v) = reply.try_recv() {
++                return v;
++            }
++        }
++        panic!("no reply to {method} {params}");
++    }
++
++    fn ok(&mut self, method: &str, params: Value) -> Value {
++        let v = self.call(method, params.clone());
++        assert_eq!(v["ok"], json!(true), "{method} {params} failed: {v}");
++        v["result"].clone()
++    }
++
++    fn exec(&mut self, command: &str, params: Value) -> Value {
++        self.ok("engine.execute", json!({"command": command, "params": params}))
++    }
++
++    fn click(&mut self, id: &str) {
++        self.ok("ui.click", json!({"id": id}));
++        self.frames(2);
++    }
++
++    fn element(&mut self, id: &str) -> Option<[f32; 4]> {
++        let v = self.ok("ui.elements", json!({"prefix": id}));
++        v.as_array()?.iter().find(|e| e["id"] == id).map(|e| {
++            let r = &e["rect"];
++            [r[0].as_f64().unwrap() as f32, r[1].as_f64().unwrap() as f32, r[2].as_f64().unwrap() as f32, r[3].as_f64().unwrap() as f32]
++        })
++    }
++
++    fn ids(&mut self, prefix: &str) -> Vec<String> {
++        let v = self.ok("ui.elements", json!({"prefix": prefix}));
++        v.as_array().unwrap().iter().filter_map(|e| e["id"].as_str().map(str::to_string)).collect()
++    }
++
++    /// Press on `id` at `fx` of its width, move by `dx` over several frames, release.
++    fn drag(&mut self, id: &str, fx: f32, dx: f32, steps: usize) {
++        let r = self.element(id).unwrap_or_else(|| panic!("no element {id}"));
++        let mut p = egui::pos2(r[0] + r[2] * fx, r[1] + r[3] / 2.0);
++        let push = |d: &mut Self, e: egui::Event| d.harness.input_mut().events.push(e);
++        push(self, egui::Event::PointerMoved(p));
++        self.frames(1);
++        push(self, egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
++        self.frames(1);
++        for _ in 0..steps {
++            p.x += dx / steps as f32;
++            push(self, egui::Event::PointerMoved(p));
++            self.frames(1);
++        }
++        push(self, egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
++        self.frames(3);
++    }
++
++    fn snapshot(&mut self, name: &str) {
++        let Some(dir) = self.snapshots.clone() else { return };
++        self.frames(2);
++        match self.harness.render() {
++            Ok(img) => {
++                std::fs::create_dir_all(&dir).unwrap();
++                img.save(dir.join(format!("{name}.png"))).unwrap();
++            }
++            Err(e) => eprintln!("snapshot {name} skipped: {e}"),
++        }
++    }
++
++    fn undo_len(&mut self) -> usize {
++        self.exec("history.list", json!({}))["undo"].as_array().unwrap().len()
++    }
++
++    /// Audio clip on A1 (id) with Voice Isolation applied and selected; Effect Controls showing it.
++    fn audio_clip_with_voice_isolation(&mut self) -> u64 {
++        self.ok("ui.set", json!({"workspace": "Effects"}));
++        let seq = self.exec("sequence.inspect", json!({}));
++        let clip = &seq["audio"][0]["items"][0];
++        let (id, start, dur) = (clip["clip"].as_u64().unwrap(), clip["start"].as_i64().unwrap(), clip["duration"].as_i64().unwrap_or(0));
++        // the playhead well inside the clip, so the editor has audio on both sides
++        self.exec("playhead.set", json!({"time": start + dur / 2}));
++        self.exec("sequence.linkedSelection", json!({"on": false}));
++        self.exec("timeline.select", json!({"clips": [id]}));
++        self.exec("effects.apply", json!({"clips": [id], "effect": "voice_isolation"}));
++        self.frames(3);
++        for fx in ["volume", "channel_volume", "panner"] {
++            self.click(&format!("effectControls.effect.{fx}.twirl"));
++        }
++        id
++    }
++
++    fn clip_param(&mut self, clip: u64, param: &str) -> Value {
++        let seq = self.exec("sequence.inspect", json!({}));
++        let items = seq["audio"][0]["items"].as_array().unwrap().clone();
++        let it = items.iter().find(|i| i["clip"] == clip).unwrap().clone();
++        let fx = it["effects"].as_array().unwrap().iter().find(|e| e["effect"] == "voice_isolation").unwrap().clone();
++        fx["params"][param]["value"].clone()
++    }
++}
++
++/// A parameter value from `sequence.inspect` (`"Float(3.5)"`, `"Choice(1)"`) or plain JSON.
++fn num(v: &Value) -> f64 {
++    v.as_f64()
++        .or_else(|| v.as_str().and_then(|s| s.trim_start_matches("Float(").trim_start_matches("Choice(").trim_end_matches(')').parse().ok()))
++        .unwrap_or(f64::NAN)
++}
++
++#[test]
++fn clip_editor_view_presets_listen_and_reset() {
++    let mut d = Driver::demo();
++    let clip = d.audio_clip_with_voice_isolation();
++    // Effect Controls lists every parameter of the effect
++    let rows = d.ids("effectControls.");
++    assert!(rows.iter().any(|i| i == "effectControls.effect.voice_isolation.edit"), "{rows:?}");
++    d.click("effectControls.effect.voice_isolation.edit");
++    d.frames(3);
++    let ids = d.ids("fxEditor.voice_isolation.");
++    for id in [
++        "view",
++        "voice",
++        "preset.gentle",
++        "preset.balanced",
++        "preset.strong",
++        "preset.music",
++        "listen.0",
++        "listen.1",
++        "param.amount",
++        "param.sensitivity",
++        "param.floor",
++        "param.center_focus",
++        "param.output",
++        "toggle.preserve_formants",
++        "reset",
++        "close",
++    ] {
++        assert!(ids.iter().any(|i| *i == format!("fxEditor.voice_isolation.{id}")), "{id} missing from {ids:?}");
++    }
++    d.snapshot("voice-isolation-editor");
++    // a preset writes four parameters as one undo step
++    let undo0 = d.undo_len();
++    d.click("fxEditor.voice_isolation.preset.strong");
++    assert_eq!(num(&d.clip_param(clip, "amount")), 100.0);
++    assert_eq!(num(&d.clip_param(clip, "sensitivity")), 85.0);
++    assert_eq!(num(&d.clip_param(clip, "floor")), -70.0);
++    assert_eq!(num(&d.clip_param(clip, "center_focus")), 40.0);
++    assert_eq!(d.undo_len(), undo0 + 1, "a preset is one undo step");
++    d.exec("edit.undo", json!({}));
++    assert_eq!(num(&d.clip_param(clip, "amount")), 85.0);
++    // listen to what is removed
++    d.click("fxEditor.voice_isolation.listen.1");
++    assert_eq!(num(&d.clip_param(clip, "listen")), 1.0);
++    d.snapshot("voice-isolation-editor-background");
++    // dragging the Amount slider left lowers it — one undo step for the drag
++    let undo1 = d.undo_len();
++    d.drag("fxEditor.voice_isolation.param.amount", 0.6, -80.0, 6);
++    let a = num(&d.clip_param(clip, "amount"));
++    assert!(a < 85.0, "amount after drag: {a}");
++    assert_eq!(d.undo_len(), undo1 + 1);
++    // reset brings every parameter back
++    d.click("fxEditor.voice_isolation.reset");
++    assert_eq!(num(&d.clip_param(clip, "amount")), 85.0);
++    assert_eq!(num(&d.clip_param(clip, "listen")), 0.0);
++    d.click("fxEditor.voice_isolation.close");
++    assert!(d.ids("fxEditor.voice_isolation.").is_empty(), "window closed");
++}
++
++#[test]
++fn track_editor_from_the_mixer_slot() {
++    let mut d = Driver::demo();
++    d.exec("mixer.addInsert", json!({"strip": "A1", "effect": "voice_isolation"}));
++    d.ok("ui.set", json!({"workspace": "Audio"}));
++    d.frames(3);
++    d.click("mixer.showEffects");
++    d.click("mixer.A1.fx.0");
++    d.click("mixer.A1.fx.0.edit");
++    d.frames(3);
++    assert!(d.element("fxEditor.voice_isolation.view").is_some());
++    d.click("fxEditor.voice_isolation.preset.music");
++    let m = d.exec("mixer.inspect", json!({}));
++    let a1 = m["strips"].as_array().unwrap().iter().find(|s| s["ref"] == "A1").unwrap().clone();
++    let p = &a1["inserts"][0]["params"];
++    assert_eq!(num(&p["center_focus"]), 70.0, "{a1}");
++    assert_eq!(num(&p["sensitivity"]), 90.0, "{a1}");
++    d.snapshot("voice-isolation-track-editor");
++}
++
++#[test]
++fn essential_sound_isolate_voice_switch() {
++    let mut d = Driver::demo();
++    d.ok("ui.set", json!({"workspace": "Audio"}));
++    d.frames(3);
++    let seq = d.exec("sequence.inspect", json!({}));
++    let a1 = seq["audio"][0]["items"][0]["clip"].as_u64().unwrap();
++    d.exec("timeline.select", json!({"clips": [a1]}));
++    d.frames(3);
++    d.click("essentialSound.type.Dialogue");
++    d.frames(2);
++    let ids = d.ids("essentialSound.repair.");
++    for id in ["essentialSound.repair.isolate.on", "essentialSound.repair.isolate.amount", "essentialSound.repair.noise.on"] {
++        assert!(ids.iter().any(|i| i == id), "{id} missing from {ids:?}");
++    }
++    d.click("essentialSound.repair.isolate.on");
++    let c = d.exec("essentialSound.inspect", json!({"clips": [a1]}))["clips"][0].clone();
++    assert_eq!(c["settings"]["repair"]["isolate"]["on"], true);
++    assert!(c["effects"].as_array().unwrap().iter().any(|e| e["effect"] == "voice_isolation"), "{c}");
++    d.snapshot("voice-isolation-essential-sound");
++}
